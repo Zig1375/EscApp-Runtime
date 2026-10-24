@@ -1,0 +1,68 @@
+name: Wine
+
+# Builds EscApp's Wine (wine/build.sh) and attaches the archive to a release, for the runtime manifest.
+# Run by hand: Actions → Wine → Run workflow. A revision that already has a release is refused, because the
+# manifest pins each archive by SHA-256 and a rebuild never gives the same bytes. The release's description comes
+# from wine/release-notes/<tag>.md, committed with the change; a revision without one is refused before building.
+
+on:
+  workflow_dispatch:
+    inputs:
+      revision:
+        description: Build number of this Wine version (escapp-wine-<wine>-<revision>)
+        required: true
+        default: "1"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v5
+      - name: Release notes
+        env:
+          REVISION: ${{ inputs.revision }}
+        run: |
+          [[ "$REVISION" =~ ^[0-9]+$ ]] || { echo "revision must be a number" >&2; exit 1; }
+          # The tag carries the Wine version too; it is read from the script so the two can't disagree.
+          wine_version="$(sed -n 's/^WINE_VERSION="\(.*\)"$/\1/p' wine/build.sh)"
+          tag="wine-$wine_version-$REVISION"
+          echo "TAG=$tag" >> "$GITHUB_ENV"
+          [ -f "wine/release-notes/$tag.md" ] \
+            || { echo "::error::Add wine/release-notes/$tag.md (what changed in this build) and commit it first."; exit 1; }
+      - name: Tools
+        run: |
+          softwareupdate --install-rosetta --agree-to-license || true
+          brew install bison pkgconf freetype gnutls sdl2 mingw-w64
+      - name: Downloads cache
+        uses: actions/cache@v6
+        with:
+          path: wine/.cache/dl
+          key: wine-dl-${{ hashFiles('wine/build.sh') }}
+          restore-keys: wine-dl-
+      - name: Build
+        env:
+          REVISION: ${{ inputs.revision }}
+        run: |
+          export BASE_URL="https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG"
+          wine/build.sh || { tail -n 60 wine/.cache/work/build/make.out 2>/dev/null; exit 1; }
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd wine/dist
+          archive="$(ls escapp-wine-*.tar.xz)"
+          sha="$(shasum -a 256 "$archive" | cut -d' ' -f1)"; size="$(stat -f%z "$archive")"
+          ../release-notes.sh "$TAG" "$archive" escapp-wine-*.component.json "$GITHUB_SHA" > "$RUNNER_TEMP/notes.md"
+          gh release create "$TAG" "$archive" escapp-wine-*.component.json --target "$GITHUB_SHA" \
+            --title "Wine for EscApp: $TAG" --notes-file "$RUNNER_TEMP/notes.md"
+          echo "archive: $archive"; echo "sha256:  $sha"; echo "size:    $size"
+          {
+            echo "### $archive"
+            echo "- sha256: \`$sha\`"
+            echo "- size: $size bytes"
+            echo '```json'; cat escapp-wine-*.component.json; echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

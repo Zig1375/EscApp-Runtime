@@ -1,0 +1,228 @@
+winemac.drv: Export macdrv_functions for DXMT.
+
+DXMT's winemetal.so creates its Metal layer through a table that it looks up
+with dlsym(RTLD_DEFAULT, "macdrv_functions"), in a layout DXMT defines.
+Stock Wine doesn't export it, and DXMT then fails with "Failed to create
+metal view". Since Wine 10 the window data no longer has the client Cocoa view
+DXMT reads, so get_win_data() here returns the old layout, backed by a client
+surface made for the window and released when the window is destroyed.
+
+Written for EscApp against Wine 11.20. Like the code it changes, this patch is
+licensed under the GNU LGPL 2.1 or later (see the header of dxmt.c).
+
+diff --git a/dlls/winemac.drv/Makefile.in b/dlls/winemac.drv/Makefile.in
+index 1eb2b9c..811974e 100644
+--- a/dlls/winemac.drv/Makefile.in
++++ b/dlls/winemac.drv/Makefile.in
+@@ -28,6 +28,7 @@ SOURCES = \
+ 	cocoa_window.m \
+ 	display.c \
+ 	dllmain.c \
++	dxmt.c \
+ 	event.c \
+ 	gdi.c \
+ 	image.c \
+diff --git a/dlls/winemac.drv/dxmt.c b/dlls/winemac.drv/dxmt.c
+new file mode 100644
+index 0000000..7bd436a
+--- /dev/null
++++ b/dlls/winemac.drv/dxmt.c
+@@ -0,0 +1,173 @@
++/*
++ * Mac driver entry points for DXMT
++ *
++ * Copyright 2026 EscApp contributors
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++/* DXMT's unix library (winemetal.so) draws into a Metal layer that it asks
++ * this driver for. It finds the driver through a table exported as
++ * "macdrv_functions" (looked up with dlsym(RTLD_DEFAULT)), laid out as DXMT
++ * expects. Its get_win_data() is expected to return the window data
++ * layout of older Wine, with the client area's Cocoa view in the fourth
++ * pointer. Since Wine 10 the client area belongs to client surfaces, so this
++ * file gives each window that DXMT asks about a client surface of its own
++ * and hands DXMT a small structure in the old layout that points to it. */
++
++#if 0
++#pragma makedep unix
++#endif
++
++#include "config.h"
++
++#include "macdrv.h"
++#include "wine/debug.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(macdrv);
++
++/* Window data in the layout DXMT reads; only the first four fields are
++ * part of that contract. */
++struct dxmt_win_data
++{
++    HWND                     hwnd;
++    WineWindow              *cocoa_window;
++    WineContentView         *cocoa_view;
++    WineContentView         *client_cocoa_view;
++    struct macdrv_win_data  *data;
++};
++
++/* One client surface per window that DXMT renders to, kept until the window
++ * is destroyed: DXMT's Metal view is a subview of the surface's Cocoa view,
++ * so the view has to outlive the get_win_data/release_win_data pair. */
++static pthread_mutex_t dxmt_mutex = PTHREAD_MUTEX_INITIALIZER;
++static CFMutableDictionaryRef dxmt_surfaces;
++
++static struct macdrv_client_surface *dxmt_get_surface(HWND hwnd)
++{
++    struct macdrv_client_surface *surface = NULL, *created;
++    struct client_surface *client;
++
++    pthread_mutex_lock(&dxmt_mutex);
++    if (dxmt_surfaces) surface = (struct macdrv_client_surface *)CFDictionaryGetValue(dxmt_surfaces, hwnd);
++    pthread_mutex_unlock(&dxmt_mutex);
++    if (surface) return surface;
++
++    /* Created outside both locks: it calls into win32u and takes the window data lock itself.
++     * Same format and scaling as win32u asks for when it makes a Vulkan surface. */
++    if (!(client = macdrv_CreateClientSurface(hwnd, 0, FALSE))) return NULL;
++    created = impl_from_client_surface(client);
++
++    pthread_mutex_lock(&dxmt_mutex);
++    if (!dxmt_surfaces) dxmt_surfaces = CFDictionaryCreateMutable(NULL, 0, NULL, NULL);
++    if (!(surface = (struct macdrv_client_surface *)CFDictionaryGetValue(dxmt_surfaces, hwnd)))
++    {
++        CFDictionarySetValue(dxmt_surfaces, hwnd, created);
++        surface = created;
++        created = NULL;
++    }
++    pthread_mutex_unlock(&dxmt_mutex);
++
++    if (created) client_surface_release(&created->client);
++    return surface;
++}
++
++/***********************************************************************
++ *              macdrv_dxmt_destroy_window
++ *
++ * Drop the client surface made for DXMT, if any, when its window goes away.
++ */
++void macdrv_dxmt_destroy_window(HWND hwnd)
++{
++    struct macdrv_client_surface *surface = NULL;
++
++    pthread_mutex_lock(&dxmt_mutex);
++    if (dxmt_surfaces && (surface = (struct macdrv_client_surface *)CFDictionaryGetValue(dxmt_surfaces, hwnd)))
++        CFDictionaryRemoveValue(dxmt_surfaces, hwnd);
++    pthread_mutex_unlock(&dxmt_mutex);
++
++    if (surface)
++    {
++        TRACE("releasing surface for %p\n", hwnd);
++        client_surface_release(&surface->client);
++    }
++}
++
++static struct dxmt_win_data *dxmt_get_win_data(HWND hwnd)
++{
++    struct macdrv_client_surface *surface;
++    struct macdrv_win_data *data;
++    struct dxmt_win_data *ret;
++
++    TRACE("%p\n", hwnd);
++
++    if (!(surface = dxmt_get_surface(hwnd))) return NULL;
++    if (!(data = get_win_data(hwnd))) return NULL;
++    if (!(ret = calloc(1, sizeof(*ret))))
++    {
++        release_win_data(data);
++        return NULL;
++    }
++    ret->hwnd = hwnd;
++    ret->cocoa_window = data->cocoa_window;
++    ret->cocoa_view = surface->cocoa_view;
++    ret->client_cocoa_view = surface->cocoa_view;
++    ret->data = data;
++    return ret;
++}
++
++static void dxmt_release_win_data(struct dxmt_win_data *win_data)
++{
++    if (!win_data) return;
++    release_win_data(win_data->data);
++    free(win_data);
++}
++
++/* Part of the table DXMT expects; DXMT doesn't call it. */
++static void dxmt_init_display_devices(BOOL force)
++{
++    TRACE("%d, ignored\n", force);
++}
++
++/* OnMainThread() takes a dispatch block; a block is passed as a plain pointer. */
++extern void OnMainThread(void *block);
++
++struct macdrv_functions_t
++{
++    void (*macdrv_init_display_devices)(BOOL);
++    struct dxmt_win_data *(*get_win_data)(HWND hwnd);
++    void (*release_win_data)(struct dxmt_win_data *data);
++    WineWindow *(*macdrv_get_cocoa_window)(HWND hwnd, bool require_on_screen);
++    MTLDevice_id (*macdrv_create_metal_device)(void);
++    void (*macdrv_release_metal_device)(MTLDevice_id d);
++    WineMetalView *(*macdrv_view_create_metal_view)(WineContentView *v, MTLDevice_id d);
++    CAMetalLayer *(*macdrv_view_get_metal_layer)(WineMetalView *v);
++    void (*macdrv_view_release_metal_view)(WineMetalView *v);
++    void (*on_main_thread)(void *block);
++};
++
++__attribute__((visibility("default"))) struct macdrv_functions_t macdrv_functions =
++{
++    dxmt_init_display_devices,
++    dxmt_get_win_data,
++    dxmt_release_win_data,
++    macdrv_get_cocoa_window,
++    macdrv_create_metal_device,
++    macdrv_release_metal_device,
++    macdrv_view_create_metal_view,
++    macdrv_view_get_metal_layer,
++    macdrv_view_release_metal_view,
++    OnMainThread,
++};
+diff --git a/dlls/winemac.drv/macdrv.h b/dlls/winemac.drv/macdrv.h
+index 89c498f..5e5904c 100644
+--- a/dlls/winemac.drv/macdrv.h
++++ b/dlls/winemac.drv/macdrv.h
+@@ -253,6 +253,7 @@ extern void macdrv_ime_set_text(HWND hwnd, CFStringRef text, bool complete,
+ 
+ extern struct macdrv_client_surface *impl_from_client_surface(struct client_surface *client);
+ extern bool macdrv_client_surface_acquire_metal_swapchain(struct macdrv_client_surface *surface);
++extern void macdrv_dxmt_destroy_window(HWND hwnd);
+ 
+ extern struct macdrv_win_data *get_win_data(HWND hwnd);
+ extern void release_win_data(struct macdrv_win_data *data);
+diff --git a/dlls/winemac.drv/window.c b/dlls/winemac.drv/window.c
+index 552971f..39fab9f 100644
+--- a/dlls/winemac.drv/window.c
++++ b/dlls/winemac.drv/window.c
+@@ -1261,6 +1261,8 @@ void macdrv_DestroyWindow(HWND hwnd)
+ 
+     TRACE("%p\n", hwnd);
+ 
++    macdrv_dxmt_destroy_window(hwnd);
++
+     if (!(data = get_win_data(hwnd))) return;
+ 
+     if (data->drag_event) NtSetEvent(data->drag_event, NULL);

@@ -1,0 +1,113 @@
+wow64cpu: Switch between 32- and 64-bit code with far returns.
+
+32-bit programs crashed at random under Rosetta 2 inside wow64cpu.dll
+("Unhandled page fault ... in wow64 32-bit code"), in about one start of four
+for a small Direct3D 9 test program on an M2 Max. The crash is in the far jump
+(ljmp) that changes the code segment when entering or leaving 64-bit code: a
+signal arriving there leaves the thread in a state Wine can't resume.
+
+Both switches now use a far return instead. The 32-to-64 thunk pushes the
+64-bit selector and the handler's address and executes retf, which leaves the
+32-bit stack as it was, so the handlers see the same state as before. The way
+back builds a far-return frame (rip, cs) just below the 32-bit stack pointer
+and executes lretq. Far returns are valid on x86 hardware too, so no check for
+Rosetta is needed.
+
+This patch is licensed under the GNU LGPL 2.1 or later, like the code it
+changes.
+
+diff --git a/dlls/wow64cpu/cpu.c b/dlls/wow64cpu/cpu.c
+index 3d73ff3..c77d3e8 100644
+--- a/dlls/wow64cpu/cpu.c
++++ b/dlls/wow64cpu/cpu.c
+@@ -30,14 +30,17 @@
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(wow);
+ 
++/* The switches between 32- and 64-bit code use far returns rather than far jumps. Under Rosetta 2 a far jump
++ * that changes the code segment can be interrupted by a signal in a state Wine can't recover from, and 32-bit
++ * programs then crash at random in this module; far returns switch cleanly. On x86 hardware both work. */
+ #pragma pack(push,1)
+ struct thunk_32to64
+ {
+-    BYTE  ljmp;   /* jump far, absolute indirect */
+-    BYTE  modrm;  /* address=disp32, opcode=5 */
+-    DWORD op;
++    BYTE  push_cs;    /* push imm32 */
++    DWORD cs;
++    BYTE  push_addr;  /* push imm32 */
+     DWORD addr;
+-    WORD  cs;
++    BYTE  retf;       /* far return: pops addr, then cs */
+ };
+ struct thunk_opcodes
+ {
+@@ -204,13 +207,15 @@ __ASM_GLOBAL_FUNC( syscall_32to64,
+                    "movl 0xb4(%r13),%ebp\n\t"   /* context->Ebp */
+                    "btrl $0,-4(%r13)\n\t"       /* cpu->Flags & WOW64_CPURESERVED_FLAG_RESET_STATE */
+                    "jc .Lsyscall_32to64_return\n\t"
++                   /* far return frame (rip, cs) just below the 32-bit stack pointer */
++                   "movl 0xc4(%r13),%r14d\n\t"  /* context->Esp */
+                    "movl 0xb8(%r13),%edx\n\t"   /* context->Eip */
+-                   "movl %edx,(%rsp)\n\t"
++                   "movq %rdx,-16(%r14)\n\t"
+                    "movl 0xbc(%r13),%edx\n\t"   /* context->SegCs */
+-                   "movl %edx,4(%rsp)\n\t"
+-                   "movl 0xc4(%r13),%r14d\n\t"  /* context->Esp */
++                   "movq %rdx,-8(%r14)\n\t"
++                   "subq $16,%r14\n\t"
+                    "xchgq %r14,%rsp\n\t"
+-                   "ljmp *(%r14)\n"
++                   "lretq\n"
+                    ".Lsyscall_32to64_return:\n\t"
+                    "movq %rsp,%r14\n\t"
+                    "movl 0xa8(%r13),%edx\n\t"   /* context->Edx */
+@@ -264,13 +269,15 @@ __ASM_GLOBAL_FUNC( unix_call_32to64,
+                    "movl %eax,0xb0(%r13)\n\t"   /* context->Eax */
+                    "btrl $0,-4(%r13)\n\t"       /* cpu->Flags & WOW64_CPURESERVED_FLAG_RESET_STATE */
+                    "jc .Lsyscall_32to64_return\n\t"
++                   /* far return frame (rip, cs) just below the 32-bit stack pointer */
++                   "movl 0xc4(%r13),%r14d\n\t"  /* context->Esp */
+                    "movl 0xb8(%r13),%edx\n\t"   /* context->Eip */
+-                   "movl %edx,(%rsp)\n\t"
++                   "movq %rdx,-16(%r14)\n\t"
+                    "movl 0xbc(%r13),%edx\n\t"   /* context->SegCs */
+-                   "movl %edx,4(%rsp)\n\t"
+-                   "movl 0xc4(%r13),%r14d\n\t"  /* context->Esp */
++                   "movq %rdx,-8(%r14)\n\t"
++                   "subq $16,%r14\n\t"
+                    "xchgq %r14,%rsp\n\t"
+-                   "ljmp *(%r14)" )
++                   "lretq" )
+ 
+ 
+ /**********************************************************************
+@@ -335,17 +342,17 @@ NTSTATUS WINAPI BTCpuProcessInit(void)
+     cs32_sel = context_i386.SegCs;
+     ss32_sel = context_i386.SegSs;
+ 
+-    thunk->syscall_thunk.ljmp  = 0xff;
+-    thunk->syscall_thunk.modrm = 0x2d;
+-    thunk->syscall_thunk.op    = PtrToUlong( &thunk->syscall_thunk.addr );
+-    thunk->syscall_thunk.addr  = PtrToUlong( syscall_32to64 );
+-    thunk->syscall_thunk.cs    = cs64_sel;
+-
+-    thunk->unix_thunk.ljmp  = 0xff;
+-    thunk->unix_thunk.modrm = 0x2d;
+-    thunk->unix_thunk.op    = PtrToUlong( &thunk->unix_thunk.addr );
+-    thunk->unix_thunk.addr  = PtrToUlong( unix_call_32to64 );
+-    thunk->unix_thunk.cs    = cs64_sel;
++    thunk->syscall_thunk.push_cs   = 0x68;
++    thunk->syscall_thunk.cs        = cs64_sel;
++    thunk->syscall_thunk.push_addr = 0x68;
++    thunk->syscall_thunk.addr      = PtrToUlong( syscall_32to64 );
++    thunk->syscall_thunk.retf      = 0xcb;
++
++    thunk->unix_thunk.push_cs   = 0x68;
++    thunk->unix_thunk.cs        = cs64_sel;
++    thunk->unix_thunk.push_addr = 0x68;
++    thunk->unix_thunk.addr      = PtrToUlong( unix_call_32to64 );
++    thunk->unix_thunk.retf      = 0xcb;
+ 
+     NtProtectVirtualMemory( GetCurrentProcess(), (void **)&thunk, &size, PAGE_EXECUTE_READ, &old_prot );
+     return STATUS_SUCCESS;
