@@ -28,6 +28,10 @@ refuses a revision without one. Keep it current as you work:
   soon as their checks are done and never leave them for later, even if the task is interrupted. Stop the task's
   Wine processes (`wineserver -k` per prefix) first. Keep only `wine/.cache/dl` (downloads), the newest archives in
   `wine/dist` and what the next step needs, and say what was kept and why; never delete another session's folders.
+- Tests never put windows on the user's screen: the headless suites run Wine without its macOS display driver
+  (`WINEDLLOVERRIDES=...;winemac.drv=d`, so even wineboot's "updating configuration" window stays invisible), and
+  their output goes to files, never through pipes. The graphics probes need the real display: run them only when the
+  user isn't using the Mac, or ask first.
 - Never let Wine show a dialog: set `HKCU\Software\Wine\WineDbg ShowCrashDialog=dword:0` in a test prefix before
   running anything, and read crashes from the logs.
 
