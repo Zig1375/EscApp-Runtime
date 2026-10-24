@@ -17,6 +17,38 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+/* ntdll's hooks, implemented as ntdll does: a per-thread count of the locks held and wakeups owed, while which a
+ * "suspension" (SIGUSR1, see test_suspension) is held back and raised again once the count is back to 0. Long
+ * sleeps are cut into short slices here, so that test_alive_checks sees them. */
+static __thread int held, deferred;
+static int hold_errors, alive_checks;
+
+static void test_hold(void)
+{
+    held++;
+    __atomic_signal_fence( __ATOMIC_SEQ_CST );
+}
+
+static void test_unhold(void)
+{
+    __atomic_signal_fence( __ATOMIC_SEQ_CST );
+    if (--held < 0) hold_errors++;
+    if (!held)
+    {
+        __atomic_signal_fence( __ATOMIC_SEQ_CST );
+        if (deferred)
+        {
+            deferred = 0;
+            pthread_kill( pthread_self(), SIGUSR1 );
+        }
+    }
+}
+
+#define OSYNC_HOLD()        test_hold()
+#define OSYNC_UNHOLD()      test_unhold()
+#define OSYNC_CHECK_ALIVE() __atomic_add_fetch( &alive_checks, 1, __ATOMIC_RELAXED )
+#define OSYNC_SLICE_NS      20000000ull
+
 #include "wine/osync.h"
 
 static void *base;
@@ -996,6 +1028,266 @@ static void test_process_stress( long iterations )
     printf( "  process stress: 4 processes x %ld operations\n", iterations );
 }
 
+/* ---- suspension, killed threads, a vanished server ---------------------------------------------------------- */
+
+/* Wine suspends a thread with a signal (SIGUSR1) that can arrive at any instruction; ntdll holds it back while the
+ * thread holds an object lock or owes a wakeup. Here the handler "suspends" the thread for a while, as Wine does,
+ * after checking that the thread holds none of the objects' locks: otherwise everyone using that object, the
+ * server included, would wait for the suspended thread. */
+#define SUSP_THREADS 4
+static uint32_t susp_names[3], susp_alert;
+static int susp_stop;
+static long susp_suspended, susp_deferred, susp_violations;
+static __thread uint32_t my_tid;
+
+static void susp_handler( int sig )
+{
+    int i, saved_errno = errno;
+
+    if (held)
+    {
+        deferred = 1;
+        __atomic_add_fetch( &susp_deferred, 1, __ATOMIC_RELAXED );
+        return;
+    }
+    for (i = 0; i < 3; i++)
+        if ((osync_load( &osync_obj( base, cell_of( susp_names[i] ) )->lock ) & ~OSYNC_LOCK_CONTENDED) == my_tid)
+            __atomic_add_fetch( &susp_violations, 1, __ATOMIC_RELAXED );
+    if ((osync_load( &osync_header( base )->all_lock ) & ~OSYNC_LOCK_CONTENDED) == my_tid)
+        __atomic_add_fetch( &susp_violations, 1, __ATOMIC_RELAXED );
+    __atomic_add_fetch( &susp_suspended, 1, __ATOMIC_RELAXED );
+    usleep( 30 );
+    errno = saved_errno;
+}
+
+struct susp_args { int i; long rounds; };
+
+static void *susp_thread( void *arg )
+{
+    struct susp_args *a = arg;
+    uint32_t tid = tid_of( 40 + a->i ), block = new_block( tid ), prev, status;
+    uint32_t cells[3];
+    int k, invalid;
+
+    my_tid = tid;
+    held = 0;
+    for (k = 0; k < 3; k++) cells[k] = cell_of( susp_names[k] );
+    while (!__atomic_load_n( &susp_stop, __ATOMIC_RELAXED ))
+    {
+        for (k = 0; k < 16; k++)  /* mostly busy with locks held, so that signals do land there */
+        {
+            osync_event_op( base, susp_names[0], 0, tid, &prev );
+            osync_event_op( base, susp_names[0], 1, tid, &prev );
+            if (wait1( block, tid, susp_names[1], 0 ) & OSYNC_SIGNALED)
+                osync_release_semaphore( base, susp_names[1], 1, tid, &prev );
+        }
+        status = osync_wait_any( base, block, tid, 3, cells, cell_of( susp_alert ), osync_now() + 20000 );
+        if (status == (OSYNC_SIGNALED | 1)) osync_release_semaphore( base, susp_names[1], 1, tid, &prev );
+        if ((status & ~OSYNC_ABANDONED) == (OSYNC_SIGNALED | 2)) osync_release_mutex( base, susp_names[2], tid, &prev );
+        status = osync_wait_all( base, block, tid, 2, cells + 1, 0, osync_now() + 20000, &invalid );
+        if (status & OSYNC_SIGNALED)
+        {
+            osync_release_semaphore( base, susp_names[1], 1, tid, &prev );
+            osync_release_mutex( base, susp_names[2], tid, &prev );
+        }
+        if (held) __atomic_add_fetch( &hold_errors, 1, __ATOMIC_RELAXED );
+        a->rounds++;
+    }
+    return NULL;
+}
+
+static void test_suspension( long iterations )
+{
+    pthread_t threads[SUSP_THREADS];
+    struct susp_args args[SUSP_THREADS];
+    struct sigaction sa = { 0 };
+    long sent, total = 0;
+    int i;
+
+    current_test = "suspension";
+    susp_names[0] = create( OSYNC_EVENT_MANUAL, 0, 0, 0 );
+    susp_names[1] = create( OSYNC_SEMAPHORE, 2, 2, 0 );
+    susp_names[2] = create( OSYNC_MUTEX, 0, 0, 0 );
+    susp_alert = create( OSYNC_EVENT_AUTO, 0, 0, 0 );
+    sa.sa_handler = susp_handler;
+    sigaction( SIGUSR1, &sa, NULL );
+    __atomic_store_n( &susp_stop, 0, __ATOMIC_RELAXED );
+    for (i = 0; i < SUSP_THREADS; i++)
+    {
+        args[i].i = i;
+        args[i].rounds = 0;
+        pthread_create( &threads[i], NULL, susp_thread, &args[i] );
+    }
+    usleep( 10000 );
+    for (sent = 0; sent < iterations; sent++)
+    {
+        pthread_kill( threads[sent % SUSP_THREADS], SIGUSR1 );
+        if (sent % 64 == 0) usleep( 50 );
+    }
+    __atomic_store_n( &susp_stop, 1, __ATOMIC_RELAXED );
+    for (i = 0; i < SUSP_THREADS; i++)
+    {
+        pthread_join( threads[i], NULL );
+        total += args[i].rounds;
+    }
+    signal( SIGUSR1, SIG_DFL );
+    CHECK( susp_violations == 0 );
+    CHECK( susp_deferred > 0 );    /* the signals did hit threads holding locks, and were held back */
+    CHECK( susp_suspended > 0 );
+    CHECK( state_of( susp_names[1] ) == 2 );
+    CHECK( osync_owner( osync_obj( base, cell_of( susp_names[2] ) ) ) == 0 );
+    CHECK( linked_count( susp_names[1] ) == 0 && linked_count( susp_names[2] ) == 0 );
+    printf( "  suspension: %ld signals, %ld held back until the locks were released, %ld rounds\n",
+            sent, susp_deferred, total );
+}
+
+/* Every operation leaves the hold count where it found it, also on errors and timeouts. */
+static void test_hold_balance(void)
+{
+    uint32_t tid = tid_of( 50 ), other = tid_of( 51 ), block = new_block( tid ), prev;
+    uint32_t ev = create( OSYNC_EVENT_AUTO, 0, 0, 0 ), sem = create( OSYNC_SEMAPHORE, 1, 1, 0 );
+    uint32_t m = create( OSYNC_MUTEX, 0, 0, 0 ), cells[2] = { cell_of( ev ), cell_of( m ) };
+    struct osync_obj copy;
+    int invalid;
+
+    current_test = "hold balance";
+    held = 0;
+    osync_event_op( base, ev, 0, tid, &prev );
+    osync_event_op( base, ev, 2, tid, &prev );
+    osync_event_op( base, ev | 0x7f000000, 0, tid, &prev );  /* stale name */
+    osync_release_semaphore( base, sem, 1, tid, &prev );      /* over the limit */
+    osync_release_mutex( base, m, other, &prev );              /* not owned */
+    osync_read( base, m, tid, &copy );
+    wait1( block, tid, ev, 0 );
+    wait1( block, tid, ev, ms( 5 ) );
+    wait1( block, tid, m, OSYNC_INFINITE );
+    osync_release_mutex( base, m, tid, &prev );
+    osync_wait_all( base, block, tid, 2, cells, 0, osync_now() + ms( 5 ), &invalid );
+    cells[1] = cells[0];
+    osync_wait_all( base, block, tid, 2, cells, 0, 0, &invalid );
+    CHECK( held == 0 );
+    CHECK( hold_errors == 0 );
+}
+
+/* What the server does when it kills a running thread (TerminateThread): mark its block killed, cancel its wait,
+ * then abandon its mutexes. The thread runs on for a moment, and must not come to own anything after that. */
+static void server_kill_running( uint32_t block_cell, uint32_t tid, uint32_t mutex )
+{
+    struct osync_block *block = osync_block( base, block_cell );
+    osync_store( &block->killed, 1 );
+    osync_cas( &block->status, OSYNC_WAITING, OSYNC_CANCELLED );
+    osync_pass_on( base, block, osync_load( &block->status ), OSYNC_SERVER_TID );
+    server_abandon( mutex, tid );
+}
+
+struct kill_args { uint32_t block, tid, m, sem; int stop; long takes; };
+
+static void *kill_victim( void *arg )
+{
+    struct kill_args *a = arg;
+    uint32_t prev, status;
+    while (!__atomic_load_n( &a->stop, __ATOMIC_RELAXED ))
+    {
+        status = wait1( a->block, a->tid, a->m, 50000 );
+        /* the signal that ends a killed thread comes at once: it dies holding what it took */
+        if (__atomic_load_n( &osync_block( base, a->block )->killed, __ATOMIC_SEQ_CST )) return NULL;
+        if (status & OSYNC_SIGNALED) { a->takes++; osync_release_mutex( base, a->m, a->tid, &prev ); }
+        if (wait1( a->block, a->tid, a->sem, 0 ) & OSYNC_SIGNALED) osync_release_semaphore( base, a->sem, 1, a->tid, &prev );
+    }
+    return NULL;
+}
+
+static void *kill_rival( void *arg )
+{
+    struct kill_args *a = arg;
+    uint32_t tid = tid_of( 61 ), block = new_block( tid ), prev;
+    while (!__atomic_load_n( &a->stop, __ATOMIC_RELAXED ))
+        if (wait1( block, tid, a->m, 50000 ) & OSYNC_SIGNALED) osync_release_mutex( base, a->m, tid, &prev );
+    return NULL;
+}
+
+static void test_killed( int rounds )
+{
+    uint32_t tid = tid_of( 60 ), block, m, ev, prev;
+    pthread_t victim, rival;
+    struct waiter_args w;
+    int r, owned_after = 0;
+
+    current_test = "killed";
+    /* a killed thread waiting is given nothing, and returns */
+    block = new_block( tid );
+    m = create( OSYNC_MUTEX, 1, 0, tid_of( 62 ) );
+    start_waiter( &victim, &w, 0, m, OSYNC_INFINITE );
+    wait_linked( m, 1 );
+    osync_store( &osync_block( base, w.block )->killed, 1 );
+    osync_cas( &osync_block( base, w.block )->status, OSYNC_WAITING, OSYNC_CANCELLED );
+    osync_wake_block( osync_block( base, w.block ) );
+    osync_release_mutex( base, m, tid_of( 62 ), &prev );
+    pthread_join( victim, NULL );
+    CHECK( w.status == OSYNC_CANCELLED );
+    CHECK( osync_owner( osync_obj( base, cell_of( m ) ) ) == 0 );
+    CHECK( linked_count( m ) == 0 );
+
+    /* a killed thread that isn't waiting takes nothing either */
+    osync_store( &osync_block( base, block )->killed, 1 );
+    CHECK( wait1( block, tid, m, 0 ) == OSYNC_CANCELLED );
+    ev = create( OSYNC_EVENT_MANUAL, 1, 0, 0 );
+    {
+        uint32_t cells[2] = { cell_of( m ), cell_of( ev ) };
+        int invalid;
+        CHECK( osync_wait_all( base, block, tid, 2, cells, 0, 0, &invalid ) == OSYNC_CANCELLED );
+    }
+    CHECK( osync_owner( osync_obj( base, cell_of( m ) ) ) == 0 );
+
+    /* killed at any moment while it takes and releases a mutex that a rival hands over to it: once its mutexes
+     * are abandoned, it never owns the mutex again */
+    for (r = 0; r < rounds; r++)
+    {
+        struct kill_args a = { 0 };
+        a.tid = tid_of( 63 );
+        a.block = new_block( a.tid );
+        a.m = create( OSYNC_MUTEX, 0, 0, 0 );
+        a.sem = create( OSYNC_SEMAPHORE, 1, 1, 0 );
+        pthread_create( &victim, NULL, kill_victim, &a );
+        pthread_create( &rival, NULL, kill_rival, &a );
+        usleep( 200 + (r % 7) * 150 );
+        server_kill_running( a.block, a.tid, a.m );
+        usleep( 2000 );          /* the victim keeps running a while, as a killed thread does until the signal */
+        __atomic_store_n( &a.stop, 1, __ATOMIC_RELAXED );
+        pthread_join( victim, NULL );
+        pthread_join( rival, NULL );
+        if (osync_owner( osync_obj( base, cell_of( a.m ) ) ) == a.tid) owned_after++;
+    }
+    CHECK( owned_after == 0 );
+    CHECK( held == 0 );
+}
+
+/* A long sleep wakes up after every slice to let ntdll check that wineserver is still there, and still wakes up
+ * at once when signalled. */
+static void test_alive_checks(void)
+{
+    uint32_t ev = create( OSYNC_EVENT_AUTO, 0, 0, 0 ), prev;
+    struct waiter_args w;
+    pthread_t thread;
+    uint64_t t;
+    int before;
+
+    current_test = "alive checks";
+    before = __atomic_load_n( &alive_checks, __ATOMIC_RELAXED );
+    start_waiter( &thread, &w, 0, ev, OSYNC_INFINITE );
+    usleep( 150000 );
+    CHECK( __atomic_load_n( &alive_checks, __ATOMIC_RELAXED ) - before >= 4 );
+    t = osync_now();
+    osync_event_op( base, ev, 0, tid_of( 70 ), &prev );
+    pthread_join( thread, NULL );
+    CHECK( is_ok( w.status, 0 ) );
+    CHECK( osync_now() - t < ms( 50 ) );
+    t = osync_now();
+    CHECK( wait1( new_block( tid_of( 71 ) ), tid_of( 71 ), ev, ms( 70 ) ) == OSYNC_CANCELLED );
+    t = osync_now() - t;
+    CHECK( t >= ms( 69 ) && t < ms( 150 ) );
+}
+
 /* ---- main --------------------------------------------------------------------------------------------------- */
 
 static void watchdog( int sig )
@@ -1034,10 +1326,16 @@ int main( int argc, char **argv )
     test_starvation_rule();
     test_starvation();
     test_retry_death();
+    test_hold_balance();
+    test_killed( 300 );
+    test_alive_checks();
+    test_suspension( iterations / 4 );
     test_model( iterations * 5, argc > 3 ? (unsigned int)atoi( argv[3] ) : 42 );
     test_stress( iterations );
     test_process_stress( iterations / 2 );
 
+    current_test = "hold counts";
+    CHECK( hold_errors == 0 );
     printf( "%s: %d checks, %d failed\n", failures ? "OSYNC TEST FAILED" : "OSYNC TEST OK", checks, failures );
     return failures ? 1 : 0;
 }

@@ -22,6 +22,14 @@ access, type) with no reference count, so a thread killed mid-call can't leave
 a handle value uncacheable. The server signals its own objects, and cleans up after threads
 that die mid-operation or mid-wait.
 
+Wine suspends and kills threads with signals that can land anywhere, also while a thread
+holds an object's lock; wineserver, single-threaded, would then wait for that lock forever.
+So ntdll holds SIGUSR1 and SIGQUIT back while a thread holds osync locks or owes wakeups,
+and raises them once it holds none. A thread killed while running goes on for that moment:
+the server marks it killed, so that it takes nothing more, before abandoning its mutexes,
+and takes over its locks and frees its wait block only once it is surely gone. Threads
+waiting in osync check every second that wineserver is still there, and exit when it isn't.
+
 It is off unless wineserver starts with WINEOSYNC=1; processes use whatever
 the server provides. The design and its tests are described in the
 EscApp-Runtime repository (docs/osync.md, tests/osync, tests/sync,
@@ -31,10 +39,30 @@ This patch is licensed under the GNU LGPL 2.1 or later, like the code it
 changes.
 
 diff --git a/dlls/ntdll/unix/server.c b/dlls/ntdll/unix/server.c
-index fa9138d..069173f 100644
+index fa9138d..6f1042b 100644
 --- a/dlls/ntdll/unix/server.c
 +++ b/dlls/ntdll/unix/server.c
-@@ -1698,6 +1698,13 @@ void server_init_process( struct thread_data *data )
+@@ -1599,6 +1599,19 @@ void process_exit_wrapper( int status )
+ }
+ 
+ 
++#ifdef __APPLE__
++/***********************************************************************
++ *           server_connection_lost
++ *
++ * Whether wineserver closed the connection; for threads waiting in osync, which don't otherwise talk to it.
++ */
++BOOL server_connection_lost(void)
++{
++    char c;
++    return recv( fd_socket, &c, 1, MSG_PEEK | MSG_DONTWAIT ) == 0;
++}
++#endif
++
+ /***********************************************************************
+  *           server_init_process
+  *
+@@ -1698,6 +1711,13 @@ void server_init_process( struct thread_data *data )
              {
                  inproc_device_fd = wine_server_receive_fd( &handle );
                  assert( handle == reply->inproc_device );
@@ -48,19 +76,72 @@ index fa9138d..069173f 100644
              }
          }
      }
+diff --git a/dlls/ntdll/unix/signal_x86_64.c b/dlls/ntdll/unix/signal_x86_64.c
+index f807caa..7d840de 100644
+--- a/dlls/ntdll/unix/signal_x86_64.c
++++ b/dlls/ntdll/unix/signal_x86_64.c
+@@ -2533,6 +2533,9 @@ static void quit_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
+     ucontext_t *sigcontext = _sigcontext;
+     struct thread_data *data = init_handler( sigcontext );
+ 
++#ifdef __APPLE__
++    if (osync_defer_signal( data, OSYNC_DEFERRED_QUIT )) return;
++#endif
+     if (is_inside_syscall( data, RSP_sig(sigcontext) )) abort_thread( 0 );
+     user_mode_abort_thread( 0, get_syscall_frame( data ));
+ }
+@@ -2548,6 +2551,9 @@ static void usr1_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
+     ucontext_t *sigcontext = _sigcontext;
+     struct thread_data *data = init_handler( sigcontext );
+ 
++#ifdef __APPLE__
++    if (osync_defer_signal( data, OSYNC_DEFERRED_SUSPEND )) return;
++#endif
+     if (!data->teb)
+     {
+         server_select( NULL, 0, SELECT_INTERRUPTIBLE, 0, NULL, NULL );
 diff --git a/dlls/ntdll/unix/sync.c b/dlls/ntdll/unix/sync.c
-index 829c712..cca16ec 100644
+index 829c712..d2ebebf 100644
 --- a/dlls/ntdll/unix/sync.c
 +++ b/dlls/ntdll/unix/sync.c
-@@ -71,6 +71,7 @@
- #include "wine/server.h"
+@@ -72,6 +72,36 @@
  #include "wine/debug.h"
  #include "unix_private.h"
-+#include "wine/osync.h"
  
++#ifdef __APPLE__
++/* osync holds back the signals that suspend or kill a thread while it holds object locks; see osync_defer_signal() */
++static void osync_raise_deferred( struct thread_data *data );
++static void osync_check_server(void);
++
++static inline void osync_hold(void)
++{
++    get_thread_data()->osync_held++;
++    __atomic_signal_fence( __ATOMIC_SEQ_CST );
++}
++
++static inline void osync_unhold(void)
++{
++    struct thread_data *data = get_thread_data();
++
++    __atomic_signal_fence( __ATOMIC_SEQ_CST );
++    if (!--data->osync_held)
++    {
++        __atomic_signal_fence( __ATOMIC_SEQ_CST );
++        if (data->osync_deferred) osync_raise_deferred( data );
++    }
++}
++
++#define OSYNC_HOLD()        osync_hold()
++#define OSYNC_UNHOLD()      osync_unhold()
++#define OSYNC_CHECK_ALIVE() osync_check_server()
++#endif
++
++#include "wine/osync.h"
++
  WINE_DEFAULT_DEBUG_CHANNEL(sync);
  
-@@ -449,6 +450,167 @@ static NTSTATUS linux_wait_objs( int device, DWORD count, const int *objs, WAIT_
+ HANDLE keyed_event = 0;
+@@ -449,6 +479,193 @@ static NTSTATUS linux_wait_objs( int device, DWORD count, const int *objs, WAIT_
      return errno_to_status( errno );
  }
  
@@ -72,6 +153,32 @@ index 829c712..cca16ec 100644
 +static void *osync_base;
 +
 +static int get_inproc_alert_fd(void);
++
++/* Called by the SIGUSR1 and SIGQUIT handlers: while the thread holds object locks the signal is noted and raised
++ * again once it holds none (osync_unhold). Suspended or killed with a lock held, the thread would stall every
++ * other user of the object, wineserver included; and a suspended thread waits for wineserver to resume it. */
++BOOL osync_defer_signal( struct thread_data *data, int deferred )
++{
++    if (!data->osync_held) return FALSE;
++    data->osync_deferred |= deferred;
++    return TRUE;
++}
++
++static void osync_raise_deferred( struct thread_data *data )
++{
++    int deferred = data->osync_deferred;
++
++    data->osync_deferred = 0;
++    if (deferred & OSYNC_DEFERRED_QUIT) pthread_kill( pthread_self(), SIGQUIT );
++    if (deferred & OSYNC_DEFERRED_SUSPEND) pthread_kill( pthread_self(), SIGUSR1 );
++}
++
++/* A thread waiting here never talks to wineserver, so it wouldn't notice it die; when it does, the thread exits
++ * as it would on reading the closed connection. */
++static void osync_check_server(void)
++{
++    if (server_connection_lost()) abort_thread( 0 );
++}
 +
 +int osync_client_init( int fd )
 +{
@@ -228,7 +335,7 @@ index 829c712..cca16ec 100644
  #else /* NTSYNC_IOC_EVENT_READ */
  
  static NTSTATUS linux_release_semaphore_obj( int obj, ULONG count, ULONG *prev_count )
-@@ -542,6 +704,53 @@ struct inproc_sync
+@@ -542,6 +759,53 @@ struct inproc_sync
      unsigned short closed;    /* fd has been closed but sync is still referenced */
  };
  
@@ -282,7 +389,7 @@ index 829c712..cca16ec 100644
  #define INPROC_SYNC_CACHE_BLOCK_SIZE  (65536 / sizeof(struct inproc_sync))
  #define INPROC_SYNC_CACHE_ENTRIES     128
  
-@@ -555,11 +764,6 @@ static inline unsigned int inproc_sync_handle_to_index( HANDLE handle, unsigned
+@@ -555,11 +819,6 @@ static inline unsigned int inproc_sync_handle_to_index( HANDLE handle, unsigned
      return idx % INPROC_SYNC_CACHE_BLOCK_SIZE;
  }
  
@@ -294,7 +401,7 @@ index 829c712..cca16ec 100644
  static struct inproc_sync *cache_inproc_sync( HANDLE handle, struct inproc_sync *sync )
  {
      unsigned int entry, idx = inproc_sync_handle_to_index( handle, &entry );
-@@ -663,6 +867,8 @@ static struct inproc_sync *get_cached_inproc_sync( HANDLE handle )
+@@ -663,6 +922,8 @@ static struct inproc_sync *get_cached_inproc_sync( HANDLE handle )
      return cache;
  }
  
@@ -303,7 +410,7 @@ index 829c712..cca16ec 100644
  /* fd_cache_mutex must be held to avoid races with other thread receiving fds */
  static NTSTATUS get_server_inproc_sync( HANDLE handle, struct inproc_sync *sync )
  {
-@@ -675,8 +881,13 @@ static NTSTATUS get_server_inproc_sync( HANDLE handle, struct inproc_sync *sync
+@@ -675,8 +936,13 @@ static NTSTATUS get_server_inproc_sync( HANDLE handle, struct inproc_sync *sync
          {
              obj_handle_t fd_handle;
              sync->refcount = 1;
@@ -317,7 +424,7 @@ index 829c712..cca16ec 100644
              sync->access = reply->access;
              sync->type = reply->type;
              sync->closed = 0;
-@@ -687,6 +898,50 @@ static NTSTATUS get_server_inproc_sync( HANDLE handle, struct inproc_sync *sync
+@@ -687,6 +953,50 @@ static NTSTATUS get_server_inproc_sync( HANDLE handle, struct inproc_sync *sync
      return ret;
  }
  
@@ -368,7 +475,7 @@ index 829c712..cca16ec 100644
  /* returns a pointer to a cache entry; if the object could not be cached,
   * returns "cache" instead, which should be allocated on stack */
  static NTSTATUS get_inproc_sync( HANDLE handle, enum inproc_sync_type desired_type, ACCESS_MASK desired_access,
-@@ -737,6 +992,8 @@ static NTSTATUS get_inproc_sync( HANDLE handle, enum inproc_sync_type desired_ty
+@@ -737,6 +1047,8 @@ static NTSTATUS get_inproc_sync( HANDLE handle, enum inproc_sync_type desired_ty
      return STATUS_SUCCESS;
  }
  
@@ -377,7 +484,7 @@ index 829c712..cca16ec 100644
  extern NTSTATUS check_signal_access( struct inproc_sync *sync )
  {
      switch (sync->type)
-@@ -761,6 +1018,12 @@ extern NTSTATUS check_signal_access( struct inproc_sync *sync )
+@@ -761,6 +1073,12 @@ extern NTSTATUS check_signal_access( struct inproc_sync *sync )
  /* caller must hold fd_cache_mutex */
  void close_inproc_sync( HANDLE handle )
  {
@@ -390,7 +497,7 @@ index 829c712..cca16ec 100644
      struct inproc_sync *cache;
  
      if (inproc_device_fd < 0) return;
-@@ -771,6 +1034,7 @@ void close_inproc_sync( HANDLE handle )
+@@ -771,6 +1089,7 @@ void close_inproc_sync( HANDLE handle )
          release_inproc_sync( cache );
          release_inproc_sync( cache );
      }
@@ -398,7 +505,7 @@ index 829c712..cca16ec 100644
  }
  
  static NTSTATUS inproc_release_semaphore( HANDLE handle, ULONG count, ULONG *prev_count )
-@@ -884,8 +1148,13 @@ static int get_inproc_alert_fd(void)
+@@ -884,8 +1203,13 @@ static int get_inproc_alert_fd(void)
          {
              if (!server_call_unlocked( req ))
              {
@@ -427,15 +534,30 @@ index 070effd..dcdfe19 100644
      close( data->wait_fd[1] );
      close( data->reply_fd );
 diff --git a/dlls/ntdll/unix/unix_private.h b/dlls/ntdll/unix/unix_private.h
-index 7346ed1..3b7bcd6 100644
+index 7346ed1..3f399de 100644
 --- a/dlls/ntdll/unix/unix_private.h
 +++ b/dlls/ntdll/unix/unix_private.h
-@@ -228,6 +228,9 @@ extern USHORT supported_machines[8];
+@@ -126,6 +126,10 @@ struct thread_data
+     void        *start;             /* thread entry point */
+     void        *param;             /* thread entry point parameter */
+     struct list  entry;             /* entry in TEB list */
++#ifdef __APPLE__
++    int          osync_held;        /* osync: object locks held, or wakeups owed (signals are held back) */
++    int          osync_deferred;    /* osync: OSYNC_DEFERRED_* signals that arrived meanwhile */
++#endif
+     char         debug_info[0x800]; /* debug_info structure */
+     char         signal_stack[];    /* signal stack */
+     /* char kernel_stack[] */
+@@ -228,6 +232,13 @@ extern USHORT supported_machines[8];
  extern BOOL process_exiting;
  extern HANDLE keyed_event;
  extern int inproc_device_fd;
 +#ifdef __APPLE__
++#define OSYNC_DEFERRED_SUSPEND  1   /* SIGUSR1 */
++#define OSYNC_DEFERRED_QUIT     2   /* SIGQUIT */
 +extern int osync_client_init( int fd );
++extern BOOL osync_defer_signal( struct thread_data *data, int deferred );
++extern BOOL server_connection_lost(void);
 +#endif
  extern timeout_t server_start_time;
  extern sigset_t server_block_set;
@@ -454,10 +576,10 @@ index 3f23c63..b58aadf 100644
  	wine/schrpc.idl \
 diff --git a/include/wine/osync.h b/include/wine/osync.h
 new file mode 100644
-index 0000000..b4a6eb1
+index 0000000..fb79a17
 --- /dev/null
 +++ b/include/wine/osync.h
-@@ -0,0 +1,871 @@
+@@ -0,0 +1,926 @@
 +/*
 + * osync: in-process synchronization objects on macOS
 + *
@@ -494,7 +616,14 @@ index 0000000..b4a6eb1
 + * wins. A released mutex is not handed over: it becomes free and one waiter is woken (OSYNC_RETRY) to try to take
 + * it, so running threads aren't held up behind a sleeping one; whoever ends up not taking it wakes the next. A
 + * waiter that lost that race OSYNC_MAX_LOST times gets the next release handed over directly, so nobody starves
-+ * behind threads that keep re-taking the mutex. */
++ * behind threads that keep re-taking the mutex.
++ *
++ * Suspension and death: Wine suspends a thread (SuspendThread, GetThreadContext, system APCs) and kills it
++ * (TerminateThread, TerminateProcess) with signals that can arrive at any instruction. A thread stopped while
++ * holding an object lock would stall every other user of the object, the server included, so ntdll holds those
++ * signals back until the thread holds no lock and has woken whoever it handed objects to (OSYNC_HOLD). A killed
++ * thread still runs for that moment: the server marks its wait block killed before abandoning its mutexes, and
++ * nothing is given to a killed thread after that, by itself or by others. */
 +
 +#ifndef __WINE_WINE_OSYNC_H
 +#define __WINE_WINE_OSYNC_H
@@ -587,7 +716,8 @@ index 0000000..b4a6eb1
 +    uint32_t count;                     /* objects in the current wait, not counting the alert event */
 +    uint32_t sleeping;                  /* the waiter is (about to be) asleep in the kernel: wake it */
 +    uint32_t lost;                      /* times this wait was woken to retry a mutex and someone else got it */
-+    uint32_t reserved[11];
++    uint32_t killed;                    /* the thread was killed: it may run a moment longer, but takes nothing */
++    uint32_t reserved[10];
 +    struct osync_entry entries[OSYNC_MAX_ENTRIES];
 +};
 +
@@ -661,6 +791,18 @@ index 0000000..b4a6eb1
 +    return clock_gettime_nsec_np( CLOCK_UPTIME_RAW );
 +}
 +
++/* Hooks for ntdll; nothing for the server and the tests. OSYNC_HOLD() and OSYNC_UNHOLD() nest, and bracket the
++ * time a thread holds object locks or owes wakeups, during which ntdll holds back the signals that suspend or kill
++ * it. OSYNC_CHECK_ALIVE() runs after each OSYNC_SLICE_NS of a longer sleep, for ntdll to notice that wineserver is
++ * gone: a thread waiting here never talks to it. */
++#ifndef OSYNC_HOLD
++#define OSYNC_HOLD()        do { } while (0)
++#define OSYNC_UNHOLD()      do { } while (0)
++#endif
++#if defined(OSYNC_CHECK_ALIVE) && !defined(OSYNC_SLICE_NS)
++#define OSYNC_SLICE_NS      1000000000ull
++#endif
++
 +/* ---- locks ---------------------------------------------------------------------------------------------- */
 +
 +#ifdef OSYNC_SERVER
@@ -676,6 +818,7 @@ index 0000000..b4a6eb1
 +    uint32_t cur;
 +    int i;
 +
++    OSYNC_HOLD();  /* before the lock is ours: a signal right after taking it must be held back too */
 +    if (osync_cas( lock, 0, me )) return;
 +    for (i = 0; i < 1024; i++)
 +    {
@@ -700,12 +843,16 @@ index 0000000..b4a6eb1
 +{
 +    uint32_t old = __atomic_exchange_n( lock, 0, __ATOMIC_SEQ_CST );
 +    if (old & OSYNC_LOCK_CONTENDED) os_sync_wake_by_address_any( lock, 4, OS_SYNC_WAKE_BY_ADDRESS_SHARED );
++    OSYNC_UNHOLD();  /* after the wakeup: a thread sleeping on the lock must not wait for this one to resume */
 +}
 +
 +/* Takes an object's lock for an operation that can make it acquirable. Waking WaitAll waiters looks at their other
-+ * objects, which needs the WaitAll lock, taken first; returns whether it was. */
++ * objects, which needs the WaitAll lock, taken first; returns whether it was. The operation ends with
++ * osync_flush_wakes(): the thread holds back suspension until then, so that nobody it handed an object to sleeps
++ * on while it is suspended. */
 +static inline int osync_lock_for_signal( void *base, struct osync_obj *obj, uint32_t me )
 +{
++    OSYNC_HOLD();
 +    osync_lock( &obj->lock, me );
 +    if (!obj->all_waiters) return 0;
 +    osync_unlock( &obj->lock );
@@ -779,6 +926,11 @@ index 0000000..b4a6eb1
 +    }
 +}
 +
++static inline int osync_killed( struct osync_block *block )
++{
++    return __atomic_load_n( &block->killed, __ATOMIC_SEQ_CST );
++}
++
 +static inline int osync_claim( struct osync_block *block, uint32_t result )
 +{
 +    if (!osync_cas( &block->status, OSYNC_WAITING, result )) return 0;
@@ -811,11 +963,13 @@ index 0000000..b4a6eb1
 +    else osync_wake_block( block );
 +}
 +
++/* ends an operation begun with osync_lock_for_signal() */
 +static inline void osync_flush_wakes( struct osync_wakes *wakes )
 +{
 +    unsigned int i;
 +    for (i = 0; i < wakes->count; i++) osync_wake_block( wakes->blocks[i] );
 +    wakes->count = 0;
++    OSYNC_UNHOLD();
 +}
 +
 +static inline int osync_linked( struct osync_entry *entry )
@@ -874,7 +1028,7 @@ index 0000000..b4a6eb1
 +
 +            id = entry->next;
 +            if (entry->flags & OSYNC_ENTRY_ALL) continue;
-+            if (osync_load( &block->status ) != OSYNC_WAITING) continue;
++            if (osync_load( &block->status ) != OSYNC_WAITING || osync_killed( block )) continue;
 +            if (pass == 0 && __atomic_load_n( &block->lost, __ATOMIC_RELAXED ) < OSYNC_MAX_LOST) continue;
 +            if (pass == 1 && __atomic_load_n( &block->sleeping, __ATOMIC_RELAXED )) continue;
 +            tid = block->tid;
@@ -911,7 +1065,7 @@ index 0000000..b4a6eb1
 +
 +        id = entry->next;
 +        if (!(entry->flags & OSYNC_ENTRY_ALL)) continue;
-+        if (osync_load( &block->status ) != OSYNC_WAITING) continue;
++        if (osync_load( &block->status ) != OSYNC_WAITING || osync_killed( block )) continue;
 +
 +        /* The wait can't end while this entry is linked under our lock; once claimed and unlinked, the block may
 +         * be reused at once, so work from copies. */
@@ -1111,10 +1265,11 @@ index 0000000..b4a6eb1
 +    if (spin_obj) __atomic_sub_fetch( &spin_obj->spinners, 1, __ATOMIC_RELAXED );
 +    while ((status = osync_load( &block->status )) == OSYNC_WAITING)
 +    {
++        uint64_t wait = OSYNC_INFINITE;
++        int ret, sliced = 0;
++
 +        __atomic_store_n( &block->sleeping, 1, __ATOMIC_SEQ_CST );
-+        if (deadline == OSYNC_INFINITE)
-+            os_sync_wait_on_address( &block->status, OSYNC_WAITING, 4, OS_SYNC_WAIT_ON_ADDRESS_SHARED );
-+        else
++        if (deadline != OSYNC_INFINITE)
 +        {
 +            uint64_t now = osync_now();
 +            if (now >= deadline)
@@ -1126,9 +1281,26 @@ index 0000000..b4a6eb1
 +                }
 +                continue;   /* claimed meanwhile */
 +            }
-+            os_sync_wait_on_address_with_timeout( &block->status, OSYNC_WAITING, 4, OS_SYNC_WAIT_ON_ADDRESS_SHARED,
-+                                                  OS_CLOCK_MACH_ABSOLUTE_TIME, deadline - now );
++            wait = deadline - now;
 +        }
++#ifdef OSYNC_SLICE_NS
++        if (wait > OSYNC_SLICE_NS)
++        {
++            wait = OSYNC_SLICE_NS;
++            sliced = 1;
++        }
++#endif
++        if (wait == OSYNC_INFINITE)
++            ret = os_sync_wait_on_address( &block->status, OSYNC_WAITING, 4, OS_SYNC_WAIT_ON_ADDRESS_SHARED );
++        else
++            ret = os_sync_wait_on_address_with_timeout( &block->status, OSYNC_WAITING, 4,
++                                                        OS_SYNC_WAIT_ON_ADDRESS_SHARED, OS_CLOCK_MACH_ABSOLUTE_TIME,
++                                                        wait );
++#ifdef OSYNC_SLICE_NS
++        if (sliced && ret == -1 && errno == ETIMEDOUT) OSYNC_CHECK_ALIVE();
++#else
++        (void)ret; (void)sliced;
++#endif
 +    }
 +    __atomic_store_n( &block->sleeping, 0, __ATOMIC_RELAXED );
 +    return status;
@@ -1136,13 +1308,13 @@ index 0000000..b4a6eb1
 +
 +/* After OSYNC_RETRY for a mutex: take it if still free. If another thread took it, that thread wakes the next
 + * waiter when it releases it, so the caller may wait again or give up. */
-+static inline uint32_t osync_retry( void *base, uint32_t me, uint32_t cell, uint32_t slot )
++static inline uint32_t osync_retry( void *base, struct osync_block *block, uint32_t me, uint32_t cell, uint32_t slot )
 +{
 +    struct osync_obj *obj = osync_obj( base, cell );
 +    uint32_t status = 0;
 +
 +    osync_lock( &obj->lock, me );
-+    if (osync_can_take( obj, me ))
++    if (!osync_killed( block ) && osync_can_take( obj, me ))
 +    {
 +        status = OSYNC_SIGNALED | osync_abandoned( obj ) | slot;
 +        osync_take( obj, me );
@@ -1160,12 +1332,15 @@ index 0000000..b4a6eb1
 +    __atomic_store_n( &block->lost, 0, __ATOMIC_RELAXED );
 +    for (;;)
 +    {
++        /* killed: about to die; checked again under each lock, which orders it with the server's abandoning */
++        if (osync_killed( block )) return OSYNC_CANCELLED;
++
 +        /* fast path: something is acquirable already; nobody can claim an idle block */
 +        for (i = 0; i < total; i++)
 +        {
 +            struct osync_obj *obj = osync_obj( base, i < count ? cells[i] : alert );
 +            osync_lock( &obj->lock, me );
-+            if (osync_can_take( obj, me ))
++            if (!osync_killed( block ) && osync_can_take( obj, me ))
 +            {
 +                status = OSYNC_SIGNALED | osync_abandoned( obj ) | i;
 +                osync_take( obj, me );
@@ -1193,7 +1368,7 @@ index 0000000..b4a6eb1
 +                osync_unlock( &obj->lock );
 +                break;  /* claimed through an earlier object */
 +            }
-+            if (osync_can_take( obj, me ))
++            if (!osync_killed( block ) && osync_can_take( obj, me ))
 +            {
 +                if (osync_claim( block, OSYNC_SIGNALED | osync_abandoned( obj ) | i )) osync_take( obj, me );
 +                osync_unlock( &obj->lock );
@@ -1224,7 +1399,7 @@ index 0000000..b4a6eb1
 +        /* The status stays OSYNC_RETRY until the attempt is over: if this thread dies before taking the mutex,
 +         * the server sees it and wakes the next waiter instead. */
 +        i = status & OSYNC_SLOT_MASK;
-+        status = osync_retry( base, me, i < count ? cells[i] : alert, i );
++        status = osync_retry( base, block, me, i < count ? cells[i] : alert, i );
 +        osync_store( &block->status, OSYNC_IDLE );
 +        if (status) return status;
 +        __atomic_add_fetch( &block->lost, 1, __ATOMIC_RELAXED );
@@ -1265,6 +1440,7 @@ index 0000000..b4a6eb1
 +    for (i = 0; i < count; i++) osync_lock( &osync_obj( base, sorted[i] )->lock, me );
 +    if (alert_obj) osync_lock( &alert_obj->lock, me );
 +
++    if (osync_killed( block )) ok = 0;
 +    for (i = 0; i < count && ok; i++)
 +    {
 +        struct osync_obj *obj = osync_obj( base, cells[i] );
@@ -1276,6 +1452,7 @@ index 0000000..b4a6eb1
 +        for (i = 0; i < count; i++) osync_take( osync_obj( base, cells[i] ), me );
 +        status = OSYNC_SIGNALED | abandoned;
 +    }
++    else if (osync_killed( block )) status = OSYNC_CANCELLED;
 +    else if (alert_obj && osync_can_take( alert_obj, me ))
 +    {
 +        osync_take( alert_obj, me );
@@ -1372,7 +1549,7 @@ index 0dd5395..ae28cfe 100644
  	process.c \
  	procfs.c \
 diff --git a/server/inproc_sync.c b/server/inproc_sync.c
-index 522d9a4..a4a33b7 100644
+index 522d9a4..92c7f7c 100644
 --- a/server/inproc_sync.c
 +++ b/server/inproc_sync.c
 @@ -32,6 +32,9 @@
@@ -1385,7 +1562,7 @@ index 522d9a4..a4a33b7 100644
  
  #ifdef HAVE_LINUX_NTSYNC_H
  # include <linux/ntsync.h>
-@@ -223,6 +226,151 @@ static int get_obj_inproc_sync( struct object *obj, int *type )
+@@ -223,6 +226,150 @@ static int get_obj_inproc_sync( struct object *obj, int *type )
      return fd;
  }
  
@@ -1507,12 +1684,11 @@ index 522d9a4..a4a33b7 100644
 +    if (sync->name) osync_destroy( sync->name );
 +}
 +
++/* after osync_thread_killed(), called by kill_thread() */
 +void abandon_inproc_mutexes( thread_id_t tid )
 +{
 +    struct inproc_sync *mutex;
 +
-+    /* first cancel the thread's wait, so nothing gets handed to it any more */
-+    osync_thread_died( tid );
 +    LIST_FOR_EACH_ENTRY( mutex, &inproc_mutexes, struct inproc_sync, entry )
 +        osync_abandon( mutex->name, tid );
 +}
@@ -1537,7 +1713,7 @@ index 522d9a4..a4a33b7 100644
  #else /* NTSYNC_IOC_EVENT_READ */
  
  int get_inproc_device_fd(void)
-@@ -284,7 +432,11 @@ DECL_HANDLER(get_inproc_sync_fd)
+@@ -284,7 +431,11 @@ DECL_HANDLER(get_inproc_sync_fd)
      reply->access = get_handle_access( current->process, req->handle );
  
      if ((fd = get_obj_inproc_sync( obj, &reply->type )) < 0) set_error( STATUS_NOT_IMPLEMENTED );
@@ -1551,10 +1727,10 @@ index 522d9a4..a4a33b7 100644
  }
 diff --git a/server/osync.c b/server/osync.c
 new file mode 100644
-index 0000000..72ca074
+index 0000000..083d125
 --- /dev/null
 +++ b/server/osync.c
-@@ -0,0 +1,370 @@
+@@ -0,0 +1,492 @@
 +/*
 + * osync: in-process synchronization objects on macOS, server side
 + *
@@ -1577,24 +1753,35 @@ index 0000000..72ca074
 +
 +/* The server owns the region: it creates it, allocates and frees its cells, signals the objects it keeps itself
 + * (process and thread exit, APC alerts), and cleans up after threads that die, including ones killed while
-+ * holding an object's lock or waiting. See include/wine/osync.h for the layout and the operations. */
++ * holding an object's lock or waiting. See include/wine/osync.h for the layout and the operations.
++ *
++ * The server is single-threaded: while it waits for an object's lock nothing else runs, not even the noticing
++ * that the lock's holder died. So it waits only for holders that are running (a thread holds a lock for a few
++ * instructions, and ntdll keeps it from being suspended or killed meanwhile), and takes the lock over from one
++ * that is gone. */
 +
 +#include "config.h"
 +
 +#ifdef __APPLE__
 +
 +#include <assert.h>
++#include <errno.h>
 +#include <fcntl.h>
++#include <libproc.h>
++#include <signal.h>
 +#include <stdio.h>
 +#include <stdlib.h>
 +#include <string.h>
 +#include <sys/mman.h>
++#include <sys/proc.h>
 +#include <unistd.h>
 +
 +#include "ntstatus.h"
 +#include "winternl.h"
 +
 +#include "object.h"
++#include "file.h"
++#include "process.h"
 +#include "request.h"
 +#include "thread.h"
 +
@@ -1626,6 +1813,20 @@ index 0000000..72ca074
 +};
 +static struct list thread_blocks = LIST_INIT( thread_blocks );
 +
++/* Threads killed while running (TerminateThread, TerminateProcess) go on for a moment, until the signal that ends
++ * them arrives once they hold no lock. Until DYING_TIME has passed, or their process is gone, their locks are not
++ * taken over, and their wait blocks are neither cleaned up nor reused. */
++#define DYING_TIME_NS 5000000000ull
++struct dying_thread
++{
++    struct list          entry;
++    thread_id_t          tid;
++    pid_t                pid;
++    uint64_t             since;
++    struct thread_block *tb;     /* or NULL */
++};
++static struct list dying_threads = LIST_INIT( dying_threads );
++
 +static int is_enabled(void)
 +{
 +    if (enabled == -1)
@@ -1636,10 +1837,52 @@ index 0000000..72ca074
 +    return enabled;
 +}
 +
-+/* Never sleeps for good on a lock whose holder died: once the holder's thread is gone, takes the lock over. */
++/* whether a process has exited (killed with SIGKILL, say) before the server got to notice */
++static int unix_process_gone( pid_t pid )
++{
++    struct proc_bsdinfo info;
++
++    if (pid == -1) return 0;
++    if (kill( pid, 0 ) == -1) return errno == ESRCH;
++    return proc_pidinfo( pid, PROC_PIDTBSDINFO, 0, &info, sizeof(info) ) == sizeof(info) && info.pbi_status == SZOMB;
++}
++
++static struct dying_thread *find_dying( thread_id_t tid )
++{
++    struct dying_thread *dying;
++
++    LIST_FOR_EACH_ENTRY( dying, &dying_threads, struct dying_thread, entry )
++        if (dying->tid == tid) return dying;
++    return NULL;
++}
++
++/* whether the thread holding a lock can no longer release it */
++static int holder_gone( thread_id_t tid )
++{
++    struct dying_thread *dying = find_dying( tid );
++    unsigned int error;
++    struct thread *holder;
++    int gone;
++
++    if (dying)
++        return unix_process_gone( dying->pid ) || osync_now() - dying->since > DYING_TIME_NS;
++
++    error = get_error();
++    if (!(holder = get_thread_from_id( tid ))) gone = 1;  /* its locks were taken over when it died */
++    else
++    {
++        gone = holder->state == TERMINATED || unix_process_gone( holder->process->unix_pid );
++        release_object( holder );
++    }
++    set_error( error );
++    return gone;
++}
++
++/* Waits for a lock while its holder runs; takes it over from a holder that is gone. */
 +void osync_server_lock( uint32_t *lock )
 +{
-+    unsigned int i;
++    uint64_t start = 0, now;
++    unsigned int i, warned = 0;
 +    uint32_t cur;
 +
 +    for (i = 0;; i++)
@@ -1653,16 +1896,18 @@ index 0000000..72ca074
 +        }
 +        if (i % 16 == 0)
 +        {
-+            unsigned int error = get_error();
-+            struct thread *holder = get_thread_from_id( cur & ~OSYNC_LOCK_CONTENDED );
-+            int dead = !holder || holder->state == TERMINATED;
-+
-+            if (holder) release_object( holder );
-+            set_error( error );
-+            if (dead)
++            if (holder_gone( cur & ~OSYNC_LOCK_CONTENDED ))
 +            {
 +                if (osync_cas( lock, cur, OSYNC_SERVER_TID | OSYNC_LOCK_CONTENDED )) return;
 +                continue;
++            }
++            now = osync_now();
++            if (!start) start = now;
++            else if (!warned && now - start > 5000000000ull)
++            {
++                fprintf( stderr, "wineserver: osync: waiting for a lock held by thread %04x\n",
++                         cur & ~OSYNC_LOCK_CONTENDED );
++                warned = 1;
 +            }
 +        }
 +        if (!(cur & OSYNC_LOCK_CONTENDED) && !osync_cas( lock, cur, cur | OSYNC_LOCK_CONTENDED )) continue;
@@ -1878,26 +2123,24 @@ index 0000000..72ca074
 +        os_sync_wake_by_address_all( lock, 4, OS_SYNC_WAKE_BY_ADDRESS_SHARED );
 +}
 +
-+/* Called when a thread dies, after its mutexes were abandoned. A thread killed in the middle of an operation can
-+ * still hold an object's lock, and a thread killed while waiting is still linked into waiter lists. */
-+void osync_thread_died( thread_id_t tid )
++/* takes over the locks a thread that is gone still holds */
++static void steal_locks( thread_id_t tid )
 +{
-+    struct thread_block *tb;
-+    struct osync_block *block;
 +    uint32_t chunk, i;
-+
-+    if (!region) return;
 +
 +    steal_lock( &osync_header( region )->all_lock, tid );
 +    for (chunk = 1; chunk < next_chunk; chunk++)
 +        if (chunk_kind[chunk] == CHUNK_OBJECTS)
 +            for (i = 0; i < OSYNC_BLOCK_CELLS; i++)
 +                steal_lock( &osync_obj( region, chunk * OSYNC_BLOCK_CELLS + i )->lock, tid );
++}
 +
-+    if (!(tb = get_thread_block( tid, 0 ))) return;
-+    block = osync_block( region, tb->cell );
-+    osync_cas( &block->status, OSYNC_WAITING, OSYNC_CANCELLED );
-+    osync_pass_on( region, block, osync_load( &block->status ), OSYNC_SERVER_TID );
++/* unlinks a gone thread's wait from the waiter lists and frees its block */
++static void free_thread_block( struct thread_block *tb )
++{
++    struct osync_block *block = osync_block( region, tb->cell );
++    uint32_t i;
++
 +    for (i = 0; i < OSYNC_MAX_ENTRIES; i++)
 +    {
 +        struct osync_entry *entry = &block->entries[i];
@@ -1910,24 +2153,79 @@ index 0000000..72ca074
 +        osync_unlock( &obj->lock );
 +    }
 +    block->status = OSYNC_IDLE;
++    block->reserved[0] = free_blocks;
++    free_blocks = tb->cell;
++    free( tb );
++}
++
++static void dying_thread_gone( void *private )
++{
++    struct dying_thread *dying = private;
++    unsigned int error = get_error();
++    struct thread *thread = get_thread_from_id( dying->tid );
++    int reused = thread && thread->state != TERMINATED;  /* its id went to a new thread: those locks are its */
++
++    if (thread) release_object( thread );
++    set_error( error );
++    list_remove( &dying->entry );
++    if (!reused) steal_locks( dying->tid );
++    if (dying->tb) free_thread_block( dying->tb );
++    free( dying );
++}
++
++/* Called first thing when a thread is killed. gone: the thread doesn't run any more (its connection closed, or it
++ * waits in the server); otherwise it was killed while running, and goes on for a moment. A thread killed in the
++ * middle of an operation can hold an object's lock, and a thread killed while waiting is still linked into waiter
++ * lists. */
++void osync_thread_killed( struct thread *thread, int gone )
++{
++    struct dying_thread *dying = NULL;
++    struct thread_block *tb;
++    uint32_t i;
++
++    if (!region) return;
++
++    if (!gone && (dying = malloc( sizeof(*dying) )))
++    {
++        dying->tid = thread->id;
++        dying->pid = thread->process->unix_pid;
++        dying->since = osync_now();
++        dying->tb = NULL;
++        list_add_tail( &dying_threads, &dying->entry );
++    }
++    else steal_locks( thread->id );
++
++    if ((tb = get_thread_block( thread->id, 0 )))
++    {
++        /* from now on nothing is given to it, and it takes nothing: its mutexes are abandoned next, each under
++         * its lock, so it can't come to own one afterwards */
++        struct osync_block *block = osync_block( region, tb->cell );
++        osync_store( &block->killed, 1 );
++        osync_cas( &block->status, OSYNC_WAITING, OSYNC_CANCELLED );
++        osync_pass_on( region, block, osync_load( &block->status ), OSYNC_SERVER_TID );
++        list_remove( &tb->entry );
++    }
 +
 +    /* mutexes it owned whose handles are all closed, but that others still wait for */
 +    for (i = 0; i < zombie_count; i++)
 +    {
 +        struct osync_obj *obj = osync_obj( region, zombies[i] );
-+        if (obj->type == OSYNC_MUTEX) osync_abandon( obj->gen << OSYNC_GEN_SHIFT | zombies[i], tid );
++        if (obj->type == OSYNC_MUTEX) osync_abandon( obj->gen << OSYNC_GEN_SHIFT | zombies[i], thread->id );
 +    }
 +
-+    block->reserved[0] = free_blocks;
-+    free_blocks = tb->cell;
-+    list_remove( &tb->entry );
-+    free( tb );
++    if (dying)
++    {
++        /* it may still touch its block, and hold a lock: clean up once it is surely gone */
++        dying->tb = tb;
++        add_timeout_user( -(timeout_t)(DYING_TIME_NS / 100), dying_thread_gone, dying );
++    }
++    else if (tb) free_thread_block( tb );
 +}
 +
 +#endif /* __APPLE__ */
 diff --git a/server/osync.h b/server/osync.h
 new file mode 100644
-index 0000000..60908f3
+index 0000000..58c4ead
 --- /dev/null
 +++ b/server/osync.h
 @@ -0,0 +1,33 @@
@@ -1960,7 +2258,7 @@ index 0000000..60908f3
 +extern void osync_destroy( unsigned int name );
 +extern void osync_set( unsigned int name, int signaled );
 +extern void osync_abandon( unsigned int name, thread_id_t tid );
-+extern void osync_thread_died( thread_id_t tid );
++extern void osync_thread_killed( struct thread *thread, int gone );
 +extern unsigned int osync_alert_name( struct thread *thread, unsigned int alert );
 +
 +#endif
@@ -2023,7 +2321,7 @@ index e33e09d..194ffdc 100644
  
  static void dump_d3dkmt_object_create_request( const struct d3dkmt_object_create_request *req )
 diff --git a/server/thread.c b/server/thread.c
-index bb9728f..0352891 100644
+index bb9728f..5c9bd06 100644
 --- a/server/thread.c
 +++ b/server/thread.c
 @@ -59,6 +59,7 @@
@@ -2034,7 +2332,18 @@ index bb9728f..0352891 100644
  
  
  /* thread queues */
-@@ -2395,9 +2396,13 @@ DECL_HANDLER(get_inproc_alert_fd)
+@@ -1583,6 +1584,10 @@ int thread_get_inflight_fd( struct thread *thread, int client )
+ void kill_thread( struct thread *thread, int violent_death )
+ {
+     if (thread->state == TERMINATED) return;  /* already killed */
++#ifdef __APPLE__
++    /* a thread killed while running may hold osync locks for a moment more; one waiting in the server holds none */
++    osync_thread_killed( thread, !violent_death || thread->wait );
++#endif
+     thread->state = TERMINATED;
+     thread->exit_time = current_time;
+     if (current == thread) current = NULL;
+@@ -2395,9 +2400,13 @@ DECL_HANDLER(get_inproc_alert_fd)
      int fd;
  
      if ((fd = get_inproc_sync_fd( current->alert_sync )) < 0) set_error( STATUS_INVALID_PARAMETER );

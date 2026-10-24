@@ -492,6 +492,174 @@ static void check_apc(void)
     CloseHandle(ev);
 }
 
+/* --- suspension, killing and a vanished server ---------------------------------------------------------- */
+
+/* Threads suspended (SuspendThread, GetThreadContext, a system APC: all a SIGUSR1 in Wine) or killed
+ * (TerminateThread, TerminateProcess: a SIGQUIT) at any instant, also in the middle of setting, resetting or
+ * waiting on an object, while the server signals objects those threads use (an APC alerts the thread's alert
+ * event). Nothing may hang, and the objects must keep working. Run alone ("syncprobe stress-suspend"), since a
+ * hang here takes the whole server down. */
+static HANDLE st_event, st_sem, st_mutex;
+static volatile LONG st_stop, st_rounds;
+
+static void CALLBACK nop_apc(ULONG_PTR arg) { }
+
+static DWORD WINAPI st_worker(void *arg)
+{
+    while (!st_stop)
+    {
+        SetEvent(st_event);
+        ResetEvent(st_event);
+        WaitForSingleObjectEx(st_event, 0, TRUE);  /* alertable: the alert event is locked too */
+        if (WaitForSingleObject(st_sem, 0) == WAIT_OBJECT_0) ReleaseSemaphore(st_sem, 1, NULL);
+        if (WaitForSingleObject(st_mutex, 0) <= WAIT_ABANDONED) ReleaseMutex(st_mutex);
+        InterlockedIncrement(&st_rounds);
+    }
+    return 0;
+}
+
+/* TerminateThread doesn't free the thread's stack (as on Windows): small ones, or a 32-bit process runs out of
+ * address space after a thousand kills */
+static HANDLE start_st_worker(void)
+{
+    HANDLE thread = CreateThread(NULL, 65536, st_worker, NULL, STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
+    if (!thread) { printf("FAILED CreateThread %lu\n", GetLastError()); failures++; }
+    return thread;
+}
+
+static int stress_suspend_main(void)
+{
+    HANDLE workers[4];
+    CONTEXT ctx;
+    double t, end;
+    int i, suspends = 0, kills = 0;
+    DWORD r;
+
+    st_event = CreateEventW(NULL, TRUE, FALSE, NULL);
+    st_sem = CreateSemaphoreW(NULL, 2, 2, NULL);
+    st_mutex = CreateMutexW(NULL, FALSE, NULL);
+    for (i = 0; i < 4; i++) workers[i] = start_st_worker();
+    end = now_ms() + 8000;
+    for (t = now_ms(); t < end; t = now_ms())
+    {
+        i = suspends % 4;
+        SuspendThread(workers[i]);
+        ctx.ContextFlags = CONTEXT_CONTROL;
+        GetThreadContext(workers[i], &ctx);  /* returns once the thread really is suspended */
+        QueueUserAPC(nop_apc, workers[i], 0);
+        ResumeThread(workers[i]);
+        suspends++;
+        if (suspends % 50 == 0)  /* now and then kill one mid-flight and start another */
+        {
+            TerminateThread(workers[i], 1);
+            WaitForSingleObject(workers[i], INFINITE);
+            CloseHandle(workers[i]);
+            workers[i] = start_st_worker();
+            kills++;
+        }
+    }
+    st_stop = 1;
+    for (i = 0; i < 4; i++)
+    {
+        CHECK(WaitForSingleObject(workers[i], 5000) == WAIT_OBJECT_0);
+        CloseHandle(workers[i]);
+    }
+    /* the objects still work: a killed owner leaves the mutex abandoned at worst; the semaphore can have lost
+     * counts to killed threads, but not gained any */
+    r = WaitForSingleObject(st_mutex, 2000);
+    CHECK(r == WAIT_OBJECT_0 || r == WAIT_ABANDONED);
+    CHECK(ReleaseMutex(st_mutex));
+    CHECK(WaitForSingleObject(st_mutex, 0) == WAIT_OBJECT_0);
+    CHECK(ReleaseMutex(st_mutex));
+    for (i = 0; i < 2 && WaitForSingleObject(st_sem, 0) == WAIT_OBJECT_0; i++) ;
+    CHECK(WaitForSingleObject(st_sem, 0) == WAIT_TIMEOUT);
+    CHECK(ReleaseSemaphore(st_sem, 2, NULL));
+    CHECK(!ReleaseSemaphore(st_sem, 1, NULL));
+    SetEvent(st_event);
+    CHECK(WaitForSingleObject(st_event, 0) == WAIT_OBJECT_0);
+    ResetEvent(st_event);
+    CHECK(WaitForSingleObject(st_event, 50) == WAIT_TIMEOUT);
+    printf("stress-suspend: %d suspensions with APCs, %d threads killed, %ld worker rounds\n", suspends, kills, st_rounds);
+    printf(failures ? "PROBE stress-suspend FAILED (%d)\n" : "PROBE stress-suspend OK\n", failures);
+    return failures ? 1 : 0;
+}
+
+/* A child process works its objects and its alert event in a loop until run.sh kills it with SIGKILL, at any
+ * instant, also while it holds an object's lock; the parent keeps queueing APCs to it, so the server signals the
+ * child's alert event, and works the same objects. The server must not hang on a lock its dead holder will never
+ * release, and the parent must go on. "syncprobe holder <rounds>"; each round prints "holder ready" and waits for
+ * the child to die. */
+static int holder_child_main(void)
+{
+    HANDLE ev = OpenEventW(EVENT_ALL_ACCESS, FALSE, L"EscAppHolderEvent");
+    HANDLE m = OpenMutexW(MUTEX_ALL_ACCESS, FALSE, L"EscAppHolderMutex");
+    if (!ev || !m) return 1;
+    for (;;)
+    {
+        SetEvent(ev);
+        ResetEvent(ev);
+        WaitForSingleObjectEx(ev, 0, TRUE);
+        if (WaitForSingleObject(m, 0) <= WAIT_ABANDONED) ReleaseMutex(m);
+    }
+}
+
+static int holder_main(int rounds)
+{
+    HANDLE ev = CreateEventW(NULL, TRUE, FALSE, L"EscAppHolderEvent"), m = CreateMutexW(NULL, FALSE, L"EscAppHolderMutex");
+    STARTUPINFOW si = {sizeof(si)};
+    PROCESS_INFORMATION pi;
+    WCHAR cmd[MAX_PATH + 16];
+    DWORD r;
+    int round, apcs;
+
+    wcscpy(cmd, L"\"");
+    GetModuleFileNameW(NULL, cmd + 1, MAX_PATH);
+    wcscat(cmd, L"\" holder-child");
+    for (round = 0; round < rounds; round++)
+    {
+        if (!CreateProcessW(NULL, cmd, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) { printf("FAILED CreateProcess %lu\n", GetLastError()); return 1; }
+        Sleep(800);  /* the child is at work by then */
+        printf("holder ready %d\n", round);
+        for (apcs = 0; WaitForSingleObject(pi.hProcess, 0) == WAIT_TIMEOUT; apcs++)
+        {
+            QueueUserAPC(nop_apc, pi.hThread, 0);
+            SetEvent(ev);
+            ResetEvent(ev);
+            if (WaitForSingleObject(m, 0) <= WAIT_ABANDONED) ReleaseMutex(m);
+            if (apcs > 3000000) { printf("FAILED the child wasn't killed\n"); return 1; }
+        }
+        CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
+        /* the server answers, and the objects work */
+        r = WaitForSingleObject(m, 2000);
+        CHECK(r == WAIT_OBJECT_0 || r == WAIT_ABANDONED);
+        CHECK(ReleaseMutex(m));
+        SetEvent(ev);
+        CHECK(WaitForSingleObject(ev, 0) == WAIT_OBJECT_0);
+        ResetEvent(ev);
+    }
+    printf(failures ? "PROBE holder FAILED (%d)\n" : "PROBE holder OK\n", failures);
+    return failures ? 1 : 0;
+}
+
+/* Threads waiting forever on objects, until run.sh kills the server with SIGKILL: the process must then exit, as
+ * it does when its threads wait in the server. "syncprobe orphan" prints "orphan ready". */
+static DWORD WINAPI orphan_waiter(void *arg)
+{
+    WaitForSingleObject((HANDLE)arg, INFINITE);
+    return 0;
+}
+
+static int orphan_main(void)
+{
+    HANDLE ev = CreateEventW(NULL, TRUE, FALSE, NULL), m = CreateMutexW(NULL, TRUE, NULL);
+    CreateThread(NULL, 0, orphan_waiter, ev, 0, NULL);
+    CreateThread(NULL, 0, orphan_waiter, ev, 0, NULL);
+    Sleep(200);
+    printf("orphan ready\n");
+    WaitForSingleObject(ev, INFINITE);
+    return 0;
+}
+
 /* --- differential fuzz -------------------------------------------------------------------------------- */
 
 /* A seeded, single-threaded sequence of calls whose every result and state goes into a hash. The server's
@@ -597,7 +765,11 @@ int main(int argc, char **argv)
         return fuzz_main(argc > 2 ? strtoul(argv[2], NULL, 0) : 1, argc > 3 ? atoi(argv[3]) : 20000);
     }
     if (argc > 1 && !strcmp(argv[1], "child")) return child_main();
+    if (argc > 1 && !strcmp(argv[1], "holder-child")) return holder_child_main();
     setvbuf(stdout, NULL, _IONBF, 0);
+    if (argc > 1 && !strcmp(argv[1], "stress-suspend")) return stress_suspend_main();
+    if (argc > 1 && !strcmp(argv[1], "holder")) return holder_main(argc > 2 ? atoi(argv[2]) : 20);
+    if (argc > 1 && !strcmp(argv[1], "orphan")) return orphan_main();
     printf("syncprobe %d-bit\n", (int)sizeof(void *) * 8);
     if (argc < 2 || strcmp(argv[1], "bench"))  /* "bench": timings only */
     {

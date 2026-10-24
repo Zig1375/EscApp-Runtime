@@ -3,7 +3,7 @@
 Status: implemented (`wine/patches/0003`). Off unless wineserver starts with `WINEOSYNC=1`.
 Code: `include/wine/osync.h` (layout and every operation, shared by wineserver and ntdll), `server/osync.c` (the
 region, cells, cleanup after dead threads), hooks in `server/inproc_sync.c`, `server/thread.c` and
-`dlls/ntdll/unix/{sync,server,thread}.c`.
+`dlls/ntdll/unix/{sync,server,thread,signal_x86_64}.c`.
 
 ## Why
 
@@ -37,8 +37,10 @@ and the cell's reuse fails cleanly instead of touching the new object.
 
 **Locks.** Per-object lock word holding the owner's thread id (bit 0 = contended): compare-and-swap, a short spin,
 then `os_sync_wait_on_address` (shared) on the lock word. Holding one object lock never waits for another; taking
-several requires the region's WaitAll lock first, which rules out deadlocks. The server never waits on a lock held
-by a dead thread: it takes it over.
+several requires the region's WaitAll lock first, which rules out deadlocks. wineserver is single-threaded: while it
+waits for a lock nothing else runs, not even the noticing that the holder died. So it waits only for holders that
+are running, and takes the lock over from one that is gone (its thread exited, or its process did, SIGKILL
+included).
 
 **Waiting.** Each thread has a wait block (cells aligned to 32) with a status word and one entry per waited object
 (up to 64, plus the APC alert event). Fast path: lock the object, and if it can be acquired, claim the block and
@@ -68,6 +70,20 @@ the generation check and is fetched again.
 **Spinning.** A waiter spins up to 2 us before sleeping (time-based: a pause instruction costs next to nothing
 under Rosetta), and only one thread at a time spins on an object, so a crowd of waiters doesn't take the
 processors from the thread that would release it.
+
+**Suspension and death.** Wine suspends a thread (SuspendThread, GetThreadContext, system APCs) with SIGUSR1, the
+thread then waiting in its signal handler for wineserver to resume it, and kills one (TerminateThread,
+TerminateProcess, process exit) with SIGQUIT. Both can arrive at any instruction, also while the thread holds an
+object's lock: a suspended holder stalls everyone using the object, and wineserver too, which then never gets to
+resume it. So ntdll counts, per thread, the locks held and the wakeups owed (from taking a lock until the threads
+it handed objects to are woken), and the two handlers, finding the count above zero, only note the signal; it is
+raised again when the count drops to zero. A thread killed while running thus goes on for that moment: the server
+marks its wait block killed, cancels its wait, then abandons its mutexes, each under its lock; a killed thread takes
+nothing more (checked under the same locks), and nobody hands it anything. The server takes over its locks and
+frees its wait block once it is surely gone (its process exited, or 5 seconds passed). A thread waiting in osync
+never talks to wineserver and wouldn't notice it die, so long sleeps wake up every second to check the connection,
+and the thread exits if it is closed. (Without osync, a process whose threads wait in the server outlives a killed
+wineserver too; with osync it no longer does.)
 
 **PulseEvent** sets the event, hands it off to the waiters registered at that moment and resets it, all under the
 lock: exact. **WaitAll** takes the WaitAll lock and all object locks in index order, acquires all objects
@@ -106,13 +122,26 @@ In Wine on an M2 Max, median of five interleaved runs (`tests/sync` benchmarks a
   reference model (500,000 random single-threaded steps compared result by result and state by state), mutex
   contention, the anti-starvation rule (fails with it switched off) and a hot loop against a waiter, waiters woken to
   retry that die, cross-process ping-pong, processes killed mid-wait or holding a lock,
-  8-thread and 4-process stress with conservation checks, and a watchdog against hangs.
+  8-thread and 4-process stress with conservation checks, signals that "suspend" threads at any instant (none may
+  stop a thread holding a lock; fails without the holding back), threads killed while running that a rival keeps
+  handing a mutex to (none may own it after its mutexes are abandoned), balanced hold counts on every path, sleeps
+  cut into slices that check the server, and a watchdog against hangs.
 - `tests/sync/run.sh`: the same semantics through the Windows API in Wine, 32- and 64-bit, with and without osync,
   including threads terminated holding or waiting on objects, a mutex outliving its handles and a handle value reused
   after a killed waiter (must stay as fast as a fresh one); benchmarks; and a
-  differential fuzz: seeded call sequences must hash the same with osync as with wineserver.
+  differential fuzz: seeded call sequences must hash the same with osync as with wineserver. Then three ways to take
+  the server down, each run alone with a timeout: threads suspended, sent APCs and killed at any instant for 8
+  seconds (stress-suspend); a process killed with SIGKILL at a random moment while it works shared objects and the
+  parent queues APCs to it (holder); and, with osync, wineserver killed with SIGKILL under waiting threads, whose
+  process must exit (orphan).
 - `tests/winetest/run.sh`: Wine's kernel32:sync and ntdll:sync; osync may not add failures to wineserver's.
 
 These found, before release: wakeups under a held lock (a 3 us penalty), two reuse races after a hand-off
 (ThreadSanitizer), a lost wakeup when a thread woken to retry died before trying, a mutex never abandoned after
 its last handle closed (Wine's own tests), and a handle value left slow after a thread was killed waiting on it.
+
+After release (wine-11.20-4): Steam hung at start, and the whole wineserver with it, so that no new process could
+connect and Steam even outlived `wineserver -k`. A thread suspended while holding an object's lock left the server
+waiting for that lock, and a thread killed while running could have its lock taken over, or come to own a mutex
+again after it was abandoned, while it still ran. And threads waiting in osync never noticed wineserver die.
+stress-suspend, holder and orphan reproduce all of it on wine-11.20-4.
