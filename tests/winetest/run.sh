@@ -3,7 +3,8 @@
 #   tests/winetest/run.sh <wine dir> <wine source tree> <wine build tree>
 # Builds kernel32:sync and ntdll:sync from the source tree (the build tree provides the generated
 # headers and import libraries) with mingw-w64, and compares the failures in each mode with the server's: osync must
-# not add any. MODES as in tests/sync (default "WINEOSYNC=0 WINEOSYNC=1").
+# not add any. A "todo" check that passes (timing-dependent ones do now and then) is reported, not counted. MODES as
+# in tests/sync (default "WINEOSYNC=0 WINEOSYNC=1").
 set -euo pipefail
 WINE_DIR="$(cd "$1" && pwd)"; SRC="$(cd "$2" && pwd)"; BLD="$(cd "$3" && pwd)"
 cd "$(dirname "$0")"
@@ -27,20 +28,26 @@ build kernel32_sync kernel32 sync
 build ntdll_sync ntdll sync
 # ntdll:om isn't here: built this way (mingw's C library) it crashes at start even without osync.
 
-export WINEPREFIX="$T/prefix" WINEDLLOVERRIDES="mscoree,mshtml=" WINEDEBUG="${WINEDEBUG:--all}"
+# No macOS display driver (winemac.drv=d): Wine runs with its null driver, so neither wineboot's "updating
+# configuration" window nor any test window ever reaches the screen.
+export WINEPREFIX="$T/prefix" WINEDLLOVERRIDES="mscoree,mshtml=;winemenubuilder.exe=d;winemac.drv=d" WINEDEBUG="${WINEDEBUG:--all}"
 rm -rf "$WINEPREFIX"
 "$WINE_DIR/bin/wine" reg add 'HKCU\Software\Wine\WineDbg' /v ShowCrashDialog /t REG_DWORD /d 0 /f >/dev/null 2>&1
 "$WINE_DIR/bin/wineserver" -w
+# Wine's output goes to a file, never through a pipe: Wine's own background processes inherit the pipe and keep it
+# open, so a probe killed by its timeout would leave the script waiting forever.
 failed=0; m=0
 for mode in ${MODES:-WINEOSYNC=0 WINEOSYNC=1}; do
   export "${mode?}"
   : > "$T/failures.$m"
   for t in kernel32_sync ntdll_sync; do
-    out="$(cd "$T" && timeout 600 "$WINE_DIR/bin/wine" "$t.exe" 2>&1 | tr -d '\r' || true)"
+    (cd "$T" && timeout 600 "$WINE_DIR/bin/wine" "$t.exe" > "$T/out.txt" 2>&1) || true
+    out="$(tr -d '\r' < "$T/out.txt")"
     summary="$(echo "$out" | grep -E 'tests executed' | tail -1 || true)"
     echo "$mode $t: ${summary:-no summary (crashed?)}"
-    { echo "$out" | grep -E 'Test failed|Test succeeded inside todo' || true; } | sed -E 's/^[0-9a-f]+://' | sed "s/^/$t /" \
+    { echo "$out" | grep -E 'Test failed' || true; } | sed -E 's/^[0-9a-f]+://' | sed "s/^/$t /" \
       | sort -u >> "$T/failures.$m"
+    { echo "$out" | grep -E 'Test succeeded inside todo' || true; } | sed -E 's/^[0-9a-f]+://' | sed "s/^/    note: $t /"
     [ -n "$summary" ] || echo "$t crashed" >> "$T/failures.$m"
   done
   "$WINE_DIR/bin/wineserver" -k 2>/dev/null || true; "$WINE_DIR/bin/wineserver" -w 2>/dev/null || true

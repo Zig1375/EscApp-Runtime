@@ -12,10 +12,14 @@ T="${TMP_DIR:-$PWD/.out}"; mkdir -p "$T"
 for a in x64:x86_64 x86:i686; do
   "${a#*:}-w64-mingw32-gcc" -O2 -s -o "$T/syncprobe-${a%%:*}.exe" syncprobe.c
 done
-export WINEPREFIX="$T/prefix" WINEDEBUG="${WINEDEBUG:--all}" WINEDLLOVERRIDES="mscoree,mshtml="
+# No macOS display driver (winemac.drv=d): Wine runs with its null driver, so neither wineboot's "updating
+# configuration" window nor any test window ever reaches the screen.
+export WINEPREFIX="$T/prefix" WINEDEBUG="${WINEDEBUG:--all}" WINEDLLOVERRIDES="mscoree,mshtml=;winemenubuilder.exe=d;winemac.drv=d"
 rm -rf "$WINEPREFIX"
 "$WINE_DIR/bin/wine" reg add 'HKCU\Software\Wine\WineDbg' /v ShowCrashDialog /t REG_DWORD /d 0 /f >/dev/null 2>&1
 "$WINE_DIR/bin/wineserver" -w
+# Wine's output goes to a file, never through a pipe: Wine's own background processes inherit the pipe and keep it
+# open, so a probe killed by its timeout would leave the script waiting forever.
 failed=0
 rm -f "$T"/fuzz.*
 m=0
@@ -23,15 +27,17 @@ for mode in ${MODES:-WINEOSYNC=0 WINEOSYNC=1}; do
   export "${mode?}"
   for exe in syncprobe-x64.exe syncprobe-x86.exe; do
     for i in $(seq "$ROUNDS"); do
-      out="$(cd "$T" && timeout 300 "$WINE_DIR/bin/wine" "$exe" 2>&1 | tr -d '\r' || true)"
+      (cd "$T" && timeout 300 "$WINE_DIR/bin/wine" "$exe" > "$T/out.txt" 2>&1) || true
+      out="$(tr -d '\r' < "$T/out.txt")"
       echo "$mode $exe #$i: $(echo "$out" | grep -E '^PROBE' || echo 'PROBE sync FAILED (no output)')"
-      echo "$out" | grep -E '^(bench|note)' | sed 's/^/    /'
+      echo "$out" | grep -E '^(bench|note|cache)' | sed 's/^/    /'
       echo "$out" | grep -q '^PROBE sync OK' || { failed=1; echo "$out" | grep -vE '^(bench|PROBE|syncprobe)' | tail -5 | sed 's/^/    ! /'; }
     done
   done
   for exe in syncprobe-x64.exe syncprobe-x86.exe; do
     for seed in ${FUZZ_SEEDS:-1 2 3}; do
-      (cd "$T" && timeout 300 "$WINE_DIR/bin/wine" "$exe" fuzz "$seed" 20000 2>/dev/null | tr -d '\r' | grep '^fuzz' \
+      (cd "$T" && timeout 300 "$WINE_DIR/bin/wine" "$exe" fuzz "$seed" 20000 > "$T/fuzz-out.txt" 2>/dev/null) || true
+      (tr -d '\r' < "$T/fuzz-out.txt" | grep '^fuzz' \
         | sed "s/^/$exe /" || echo "$exe fuzz seed $seed FAILED") >> "$T/fuzz.$m"
     done
   done

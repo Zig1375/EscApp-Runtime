@@ -590,6 +590,86 @@ static void test_mutex_contention( long per_thread )
     printf( "  mutex contention: %d threads x %ld in %.0f ms\n", CONTENTION_THREADS, per_thread, (osync_now() - start) / 1e6 );
 }
 
+/* The rule itself, with hand-made waiters: of two queued for a mutex, the one that already lost the retry race
+ * twice gets the next release handed over, ahead of an awake one that hasn't. */
+static void test_starvation_rule(void)
+{
+    uint32_t owner = tid_of( 72 ), m = create( OSYNC_MUTEX, 1, 0, owner );
+    struct osync_obj *obj = osync_obj( base, cell_of( m ) );
+    uint32_t b1 = new_block( tid_of( 73 ) ), b2 = new_block( tid_of( 74 ) ), i;
+    struct osync_block *awake = osync_block( base, b1 ), *starving = osync_block( base, b2 );
+
+    current_test = "starvation rule";
+    for (i = 0; i < 2; i++)
+    {
+        struct osync_block *b = i ? starving : awake;
+        b->count = 1;
+        b->entries[0].obj = cell_of( m );
+        b->entries[0].slot = 0;
+        b->entries[0].flags = 0;
+        b->sleeping = i;                 /* the starving one sleeps */
+        b->lost = i ? 2 : 0;             /* two lost races: enough (OSYNC_MAX_LOST is 2) */
+        b->status = OSYNC_WAITING;
+        osync_lock( &obj->lock, owner );
+        osync_link( base, obj, &b->entries[0] );
+        osync_unlock( &obj->lock );
+    }
+    CHECK( osync_release_mutex( base, m, owner, NULL ) == OSYNC_OK );
+    CHECK( starving->status == OSYNC_SIGNALED );            /* handed over */
+    CHECK( osync_owner( obj ) == tid_of( 74 ) && obj->state == 1 );
+    CHECK( awake->status == OSYNC_WAITING );                 /* not even woken */
+    CHECK( linked_count( m ) == 1 );
+
+    /* without a starving waiter, the awake one is woken to retry and the mutex stays free for whoever is quicker */
+    starving->status = OSYNC_IDLE;
+    CHECK( osync_release_mutex( base, m, tid_of( 74 ), NULL ) == OSYNC_OK );
+    CHECK( awake->status == (OSYNC_RETRY | 0) );
+    CHECK( osync_owner( obj ) == 0 );
+    CHECK( linked_count( m ) == 0 );
+    awake->status = OSYNC_IDLE;
+}
+
+/* A thread that re-takes a mutex in a tight loop must not starve one that waits for it: after losing the race a
+ * few times, the waiter gets it handed over. */
+#define HOT_ROUNDS 20000
+static struct { uint32_t mutex; volatile long hot_done, hot_at_waiter, waiter_started; } starve;
+
+static void *hot_thread( void *p )
+{
+    uint32_t tid = tid_of( 70 ), block = new_block( tid ), cell = cell_of( starve.mutex );
+    long i;
+
+    for (i = 0; i < HOT_ROUNDS; i++)
+    {
+        osync_wait_any( base, block, tid, 1, &cell, 0, OSYNC_INFINITE );
+        if (i == 100) __atomic_store_n( &starve.waiter_started, 1, __ATOMIC_SEQ_CST );  /* let the waiter in */
+        osync_release_mutex( base, starve.mutex, tid, NULL );
+        __atomic_store_n( &starve.hot_done, i + 1, __ATOMIC_SEQ_CST );
+    }
+    return NULL;
+}
+
+static void test_starvation(void)
+{
+    uint32_t tid = tid_of( 71 ), block = new_block( tid ), cell;
+    pthread_t t;
+    uint32_t status;
+
+    current_test = "starvation";
+    memset( (void *)&starve, 0, sizeof(starve) );
+    starve.mutex = create( OSYNC_MUTEX, 0, 0, 0 );
+    cell = cell_of( starve.mutex );
+    pthread_create( &t, NULL, hot_thread, NULL );
+    while (!__atomic_load_n( &starve.waiter_started, __ATOMIC_SEQ_CST )) usleep( 10 );
+    status = osync_wait_any( base, block, tid, 1, &cell, 0, osync_now() + ms( 10000 ) );
+    starve.hot_at_waiter = __atomic_load_n( &starve.hot_done, __ATOMIC_SEQ_CST );
+    if (status == OSYNC_SIGNALED) osync_release_mutex( base, starve.mutex, tid, NULL );
+    pthread_join( t, NULL );
+    CHECK( status == OSYNC_SIGNALED );
+    CHECK( starve.hot_at_waiter < HOT_ROUNDS / 2 );
+    printf( "  starvation: the waiter got the mutex after %ld of %d hot rounds\n", starve.hot_at_waiter, HOT_ROUNDS );
+}
+
 /* A waiter woken to retry a mutex dies before taking it (or after: then it owned it): the next one must still get
  * it, through the server's cleanup. */
 static void test_retry_death(void)
@@ -951,6 +1031,8 @@ int main( int argc, char **argv )
     test_max_wait();
     test_processes();
     test_mutex_contention( iterations / 10 );
+    test_starvation_rule();
+    test_starvation();
     test_retry_death();
     test_model( iterations * 5, argc > 3 ? (unsigned int)atoi( argv[3] ) : 42 );
     test_stress( iterations );

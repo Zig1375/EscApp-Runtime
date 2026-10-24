@@ -56,7 +56,14 @@ the waiter sets the flag before the kernel compares the status, both sequentiall
 **Mutexes** are not handed over: a sleeping new owner would hold up every running thread (a lock convoy). A released
 mutex becomes free and one waiter is claimed with RETRY: it tries to take it, and if another thread was quicker,
 that thread wakes the next waiter when it releases it. The status stays RETRY until the attempt is over, so if the
-thread dies in between, the server passes the wake on.
+thread dies in between, the server passes the wake on. A waiter that loses this race twice gets the next release
+handed over directly, so a thread re-taking the mutex in a loop can't starve it.
+
+**Handle cache.** ntdll caches each handle's object so that calls don't ask the server. Wine's cache keeps a
+reference count per entry, needed on Linux to keep an fd open while a call uses it; a thread killed mid-call never
+drops its reference, and the handle value then stays uncacheable. osync has nothing to close, so on macOS an entry
+is one 64-bit value (name, access rights, type) read and written whole, with no reference count; a stale name fails
+the generation check and is fetched again.
 
 **Spinning.** A waiter spins up to 2 us before sleeping (time-based: a pause instruction costs next to nothing
 under Rosetta), and only one thread at a time spins on an object, so a crowd of waiters doesn't take the
@@ -89,23 +96,23 @@ In Wine on an M2 Max, median of five interleaved runs (`tests/sync` benchmarks a
 
 ## Known limits
 
-- Wine's handle cache in ntdll (shared with ntsync) keeps a reference that a thread killed while waiting never
-  drops; a handle value reused after that isn't cached, and calls on it fetch the object from the server each time.
 - A WaitAll naming one object twice fails, as on Windows and with ntsync; wineserver accepts it.
-- Mutexes are not first-come first-served (neither are Windows' in practice).
+- Mutexes are not strictly first-come first-served (neither are Windows'), but no waiter starves.
 
 ## Tests
 
 - `tests/osync/run.sh`: the header built natively for arm64, x86_64 (Rosetta), ThreadSanitizer and AddressSanitizer
   + UBSan; semantics of every operation, hand-off, PulseEvent, WaitAll, alerts, 64-object waits, stale names, a
   reference model (500,000 random single-threaded steps compared result by result and state by state), mutex
-  contention, waiters woken to retry that die, cross-process ping-pong, processes killed mid-wait or holding a lock,
+  contention, the anti-starvation rule (fails with it switched off) and a hot loop against a waiter, waiters woken to
+  retry that die, cross-process ping-pong, processes killed mid-wait or holding a lock,
   8-thread and 4-process stress with conservation checks, and a watchdog against hangs.
 - `tests/sync/run.sh`: the same semantics through the Windows API in Wine, 32- and 64-bit, with and without osync,
-  including threads terminated holding or waiting on objects and a mutex outliving its handles; benchmarks; and a
+  including threads terminated holding or waiting on objects, a mutex outliving its handles and a handle value reused
+  after a killed waiter (must stay as fast as a fresh one); benchmarks; and a
   differential fuzz: seeded call sequences must hash the same with osync as with wineserver.
 - `tests/winetest/run.sh`: Wine's kernel32:sync and ntdll:sync; osync may not add failures to wineserver's.
 
 These found, before release: wakeups under a held lock (a 3 us penalty), two reuse races after a hand-off
-(ThreadSanitizer), a lost wakeup when a thread woken to retry died before trying, and a mutex never abandoned
-after its last handle closed (Wine's own tests).
+(ThreadSanitizer), a lost wakeup when a thread woken to retry died before trying, a mutex never abandoned after
+its last handle closed (Wine's own tests), and a handle value left slow after a thread was killed waiting on it.

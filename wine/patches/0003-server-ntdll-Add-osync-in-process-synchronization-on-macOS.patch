@@ -15,8 +15,11 @@ event or semaphore hands it directly to a waiter, deciding with one
 compare-and-swap that a timeout races against, and wakes it only if it
 actually sleeps; a released mutex goes back to being free and one sleeping
 waiter is woken to try again, so running threads don't queue behind a
-sleeping one. PulseEvent, WaitAll and abandoned mutexes behave as on
-Windows. The server signals its own objects, and cleans up after threads
+sleeping one, and a waiter that keeps losing that race gets the next release
+handed over, so nobody starves. PulseEvent, WaitAll and abandoned mutexes behave
+as on Windows. ntdll's handle cache keeps one 64-bit value per handle (name,
+access, type) with no reference count, so a thread killed mid-call can't leave
+a handle value uncacheable. The server signals its own objects, and cleans up after threads
 that die mid-operation or mid-wait.
 
 It is off unless wineserver starts with WINEOSYNC=1; processes use whatever
@@ -46,7 +49,7 @@ index fa9138d..069173f 100644
          }
      }
 diff --git a/dlls/ntdll/unix/sync.c b/dlls/ntdll/unix/sync.c
-index 829c712..fd50fbc 100644
+index 829c712..cca16ec 100644
 --- a/dlls/ntdll/unix/sync.c
 +++ b/dlls/ntdll/unix/sync.c
 @@ -71,6 +71,7 @@
@@ -225,19 +228,82 @@ index 829c712..fd50fbc 100644
  #else /* NTSYNC_IOC_EVENT_READ */
  
  static NTSTATUS linux_release_semaphore_obj( int obj, ULONG count, ULONG *prev_count )
-@@ -634,7 +796,11 @@ static void release_inproc_sync( struct inproc_sync *sync )
-     LONG ref = InterlockedDecrement( &sync->refcount );
+@@ -542,6 +704,53 @@ struct inproc_sync
+     unsigned short closed;    /* fd has been closed but sync is still referenced */
+ };
  
-     assert( ref >= 0 );
++static BOOL is_pseudo_handle( HANDLE handle )
++{
++    return ((ULONG)(ULONG_PTR)handle >= 0xfffffffa);
++}
++
 +#ifdef __APPLE__
-+    (void)fd;  /* osync: a name, nothing to close */
-+#else
-     if (!ref) close( fd );
-+#endif
++
++/* osync: an object is a name in a region shared with the server, not an fd, so there is nothing to close and the
++ * cache needs no reference counts. An entry is one 64-bit value (name, access rights, type) read and written
++ * whole; a thread killed in the middle of a call holds nothing. A name gone stale (its handle closed and the value
++ * given to another object) fails osync's generation check and is fetched again. */
++
++#define OSYNC_CACHE_BLOCK_SIZE  (65536 / sizeof(uint64_t))
++#define OSYNC_CACHE_ENTRIES     128
++
++static uint64_t *osync_cache[OSYNC_CACHE_ENTRIES];
++
++static uint64_t *osync_cache_slot( HANDLE handle, BOOL alloc )
++{
++    unsigned int idx = (wine_server_obj_handle(handle) >> 2) - 1;
++    unsigned int entry = idx / OSYNC_CACHE_BLOCK_SIZE;
++
++    if (is_pseudo_handle( handle ) || entry >= OSYNC_CACHE_ENTRIES) return NULL;
++    if (!osync_cache[entry])
++    {
++        void *ptr;
++        if (!alloc) return NULL;
++        ptr = anon_mmap_alloc( OSYNC_CACHE_BLOCK_SIZE * sizeof(uint64_t), PROT_READ | PROT_WRITE );
++        if (ptr == MAP_FAILED) return NULL;
++        osync_cache[entry] = ptr;  /* under fd_cache_mutex */
++    }
++    return &osync_cache[entry][idx % OSYNC_CACHE_BLOCK_SIZE];
++}
++
++/* granted access never has the generic bits (28-31) set: the type goes there */
++static uint64_t osync_cache_pack( const struct inproc_sync *sync )
++{
++    return (uint64_t)(sync->access | (unsigned int)sync->type << 28) << 32 | (unsigned int)sync->fd;
++}
++
++static void release_inproc_sync( struct inproc_sync *sync )
++{
++    /* always a copy on the caller's stack */
++}
++
++#else  /* __APPLE__ */
++
+ #define INPROC_SYNC_CACHE_BLOCK_SIZE  (65536 / sizeof(struct inproc_sync))
+ #define INPROC_SYNC_CACHE_ENTRIES     128
+ 
+@@ -555,11 +764,6 @@ static inline unsigned int inproc_sync_handle_to_index( HANDLE handle, unsigned
+     return idx % INPROC_SYNC_CACHE_BLOCK_SIZE;
  }
  
- static struct inproc_sync *get_cached_inproc_sync( HANDLE handle )
-@@ -675,8 +841,13 @@ static NTSTATUS get_server_inproc_sync( HANDLE handle, struct inproc_sync *sync
+-static BOOL is_pseudo_handle( HANDLE handle )
+-{
+-    return ((ULONG)(ULONG_PTR)handle >= 0xfffffffa);
+-}
+-
+ static struct inproc_sync *cache_inproc_sync( HANDLE handle, struct inproc_sync *sync )
+ {
+     unsigned int entry, idx = inproc_sync_handle_to_index( handle, &entry );
+@@ -663,6 +867,8 @@ static struct inproc_sync *get_cached_inproc_sync( HANDLE handle )
+     return cache;
+ }
+ 
++#endif  /* __APPLE__ */
++
+ /* fd_cache_mutex must be held to avoid races with other thread receiving fds */
+ static NTSTATUS get_server_inproc_sync( HANDLE handle, struct inproc_sync *sync )
+ {
+@@ -675,8 +881,13 @@ static NTSTATUS get_server_inproc_sync( HANDLE handle, struct inproc_sync *sync
          {
              obj_handle_t fd_handle;
              sync->refcount = 1;
@@ -251,7 +317,88 @@ index 829c712..fd50fbc 100644
              sync->access = reply->access;
              sync->type = reply->type;
              sync->closed = 0;
-@@ -884,8 +1055,13 @@ static int get_inproc_alert_fd(void)
+@@ -687,6 +898,50 @@ static NTSTATUS get_server_inproc_sync( HANDLE handle, struct inproc_sync *sync
+     return ret;
+ }
+ 
++#ifdef __APPLE__
++
++/* fills "stack" and returns it */
++static NTSTATUS get_inproc_sync( HANDLE handle, enum inproc_sync_type desired_type, ACCESS_MASK desired_access,
++                                 struct inproc_sync *stack, struct inproc_sync **out )
++{
++    uint64_t *slot = osync_cache_slot( handle, FALSE ), value = slot ? __atomic_load_n( slot, __ATOMIC_ACQUIRE ) : 0;
++    struct osync_obj *obj;
++    sigset_t sigset;
++    NTSTATUS ret;
++
++    if (value && (!(obj = osync_lookup( osync_base, (uint32_t)value )) || !osync_valid( obj, (uint32_t)value )))
++        value = 0;  /* stale */
++    if (value)
++    {
++        stack->fd = (uint32_t)value;
++        stack->access = (value >> 32) & 0x0fffffff;
++        stack->type = value >> 60;
++    }
++    else
++    {
++        /* fd_cache_mutex orders this with NtClose, so that a closed handle's object is never stored after
++         * close_inproc_sync() cleared its entry */
++        server_enter_uninterrupted_section( &fd_cache_mutex, &sigset );
++        if ((ret = get_server_inproc_sync( handle, stack )))
++        {
++            server_leave_uninterrupted_section( &fd_cache_mutex, &sigset );
++            return ret;
++        }
++        if (!(stack->access & 0xf0000000) && (slot = osync_cache_slot( handle, TRUE )))
++            __atomic_store_n( slot, osync_cache_pack( stack ), __ATOMIC_RELEASE );
++        server_leave_uninterrupted_section( &fd_cache_mutex, &sigset );
++    }
++    stack->refcount = 1;
++    stack->closed = 0;
++
++    if (desired_type != INPROC_SYNC_UNKNOWN && desired_type != stack->type) return STATUS_OBJECT_TYPE_MISMATCH;
++    if ((stack->access & desired_access) != desired_access) return STATUS_ACCESS_DENIED;
++    *out = stack;
++    return STATUS_SUCCESS;
++}
++
++#else  /* __APPLE__ */
++
+ /* returns a pointer to a cache entry; if the object could not be cached,
+  * returns "cache" instead, which should be allocated on stack */
+ static NTSTATUS get_inproc_sync( HANDLE handle, enum inproc_sync_type desired_type, ACCESS_MASK desired_access,
+@@ -737,6 +992,8 @@ static NTSTATUS get_inproc_sync( HANDLE handle, enum inproc_sync_type desired_ty
+     return STATUS_SUCCESS;
+ }
+ 
++#endif  /* __APPLE__ */
++
+ extern NTSTATUS check_signal_access( struct inproc_sync *sync )
+ {
+     switch (sync->type)
+@@ -761,6 +1018,12 @@ extern NTSTATUS check_signal_access( struct inproc_sync *sync )
+ /* caller must hold fd_cache_mutex */
+ void close_inproc_sync( HANDLE handle )
+ {
++#ifdef __APPLE__
++    uint64_t *slot;
++
++    if (inproc_device_fd < 0) return;
++    if ((slot = osync_cache_slot( handle, FALSE ))) __atomic_store_n( slot, 0, __ATOMIC_RELEASE );
++#else
+     struct inproc_sync *cache;
+ 
+     if (inproc_device_fd < 0) return;
+@@ -771,6 +1034,7 @@ void close_inproc_sync( HANDLE handle )
+         release_inproc_sync( cache );
+         release_inproc_sync( cache );
+     }
++#endif
+ }
+ 
+ static NTSTATUS inproc_release_semaphore( HANDLE handle, ULONG count, ULONG *prev_count )
+@@ -884,8 +1148,13 @@ static int get_inproc_alert_fd(void)
          {
              if (!server_call_unlocked( req ))
              {
@@ -307,10 +454,10 @@ index 3f23c63..b58aadf 100644
  	wine/schrpc.idl \
 diff --git a/include/wine/osync.h b/include/wine/osync.h
 new file mode 100644
-index 0000000..859f4ae
+index 0000000..b4a6eb1
 --- /dev/null
 +++ b/include/wine/osync.h
-@@ -0,0 +1,860 @@
+@@ -0,0 +1,871 @@
 +/*
 + * osync: in-process synchronization objects on macOS
 + *
@@ -345,7 +492,9 @@ index 0000000..859f4ae
 + * switching its wait block's status from OSYNC_WAITING to the result, acquires the object on the waiter's behalf and
 + * wakes that one status word. A waiter giving up (timeout) makes the same switch to OSYNC_CANCELLED, so exactly one
 + * wins. A released mutex is not handed over: it becomes free and one waiter is woken (OSYNC_RETRY) to try to take
-+ * it, so running threads aren't held up behind a sleeping one; whoever ends up not taking it wakes the next. */
++ * it, so running threads aren't held up behind a sleeping one; whoever ends up not taking it wakes the next. A
++ * waiter that lost that race OSYNC_MAX_LOST times gets the next release handed over directly, so nobody starves
++ * behind threads that keep re-taking the mutex. */
 +
 +#ifndef __WINE_WINE_OSYNC_H
 +#define __WINE_WINE_OSYNC_H
@@ -437,7 +586,8 @@ index 0000000..859f4ae
 +    uint32_t tid;                       /* thread waiting with this block */
 +    uint32_t count;                     /* objects in the current wait, not counting the alert event */
 +    uint32_t sleeping;                  /* the waiter is (about to be) asleep in the kernel: wake it */
-+    uint32_t reserved[12];
++    uint32_t lost;                      /* times this wait was woken to retry a mutex and someone else got it */
++    uint32_t reserved[11];
 +    struct osync_entry entries[OSYNC_MAX_ENTRIES];
 +};
 +
@@ -701,14 +851,19 @@ index 0000000..859f4ae
 +    __atomic_store_n( &entry->flags, flags & ~OSYNC_ENTRY_LINKED, __ATOMIC_RELEASE );
 +}
 +
++#ifndef OSYNC_MAX_LOST
++#define OSYNC_MAX_LOST 2
++#endif
++
 +/* Hands the object to WaitAny waiters while it is acquirable. A claimed waiter's entry is unlinked here, under
 + * the lock already held, so a single-object waiter has nothing left to do. */
 +static inline void osync_wake_any( void *base, struct osync_obj *obj, struct osync_wakes *wakes )
 +{
 +    int pass;
 +
-+    /* first to waiters still spinning, who take it without a system call on either side; then to the others */
-+    for (pass = 0; pass < 2; pass++)
++    /* For a mutex, first to a waiter that keeps losing it (handed over); then, for everything, to waiters still
++     * spinning, who take it without a system call on either side; then to the others. */
++    for (pass = obj->type == OSYNC_MUTEX ? 0 : 1; pass < 3; pass++)
 +    {
 +        uint32_t id = obj->head, tid;
 +
@@ -720,10 +875,11 @@ index 0000000..859f4ae
 +            id = entry->next;
 +            if (entry->flags & OSYNC_ENTRY_ALL) continue;
 +            if (osync_load( &block->status ) != OSYNC_WAITING) continue;
-+            if (!pass && __atomic_load_n( &block->sleeping, __ATOMIC_RELAXED )) continue;
++            if (pass == 0 && __atomic_load_n( &block->lost, __ATOMIC_RELAXED ) < OSYNC_MAX_LOST) continue;
++            if (pass == 1 && __atomic_load_n( &block->sleeping, __ATOMIC_RELAXED )) continue;
 +            tid = block->tid;
 +            if (!osync_can_take( obj, tid )) continue;
-+            if (obj->type == OSYNC_MUTEX)
++            if (obj->type == OSYNC_MUTEX && pass)
 +            {
 +                if (!osync_claim( block, OSYNC_RETRY | entry->slot )) continue;
 +                osync_unlink( base, obj, entry );
@@ -1001,6 +1157,7 @@ index 0000000..859f4ae
 +    struct osync_block *block = osync_block( base, block_cell );
 +    uint32_t i, total = count + (alert ? 1 : 0), linked, status;
 +
++    __atomic_store_n( &block->lost, 0, __ATOMIC_RELAXED );
 +    for (;;)
 +    {
 +        /* fast path: something is acquirable already; nobody can claim an idle block */
@@ -1070,6 +1227,7 @@ index 0000000..859f4ae
 +        status = osync_retry( base, me, i < count ? cells[i] : alert, i );
 +        osync_store( &block->status, OSYNC_IDLE );
 +        if (status) return status;
++        __atomic_add_fetch( &block->lost, 1, __ATOMIC_RELAXED );
 +    }
 +}
 +

@@ -445,6 +445,41 @@ static void check_thread_death(void)
     CloseHandle(m); CloseHandle(s); CloseHandle(ready);
 }
 
+/* A thread killed while waiting must not leave its handle value slow for the next object that gets it (Wine's
+ * handle cache once kept such a value out of the cache for good, sending every call on it to the server). */
+static double time_set_reset(HANDLE ev, int n)
+{
+    double t = now_ms();
+    int i;
+    for (i = 0; i < n; i++) { SetEvent(ev); ResetEvent(ev); }
+    return now_ms() - t;
+}
+
+static void check_cache_after_kill(void)
+{
+    HANDLE ev, ev2, fresh, thread;
+    double t_reused, t_fresh;
+
+    ready = CreateEventW(NULL, FALSE, FALSE, NULL);
+    ev = CreateEventW(NULL, FALSE, FALSE, NULL);
+    thread = CreateThread(NULL, 0, wait_forever, ev, 0, NULL);
+    WaitForSingleObject(ready, INFINITE);
+    Sleep(100);
+    TerminateThread(thread, 1);
+    WaitForSingleObject(thread, INFINITE);
+    CloseHandle(thread);
+    CloseHandle(ev);
+    ev2 = CreateEventW(NULL, TRUE, FALSE, NULL);  /* takes the freed handle value */
+    fresh = CreateEventW(NULL, TRUE, FALSE, NULL);
+    if (ev2 != ev) printf("note: the handle value wasn't reused (%p, %p)\n", ev, ev2);
+    time_set_reset(ev2, 100); time_set_reset(fresh, 100);
+    t_reused = time_set_reset(ev2, 20000);
+    t_fresh = time_set_reset(fresh, 20000);
+    printf("cache after a killed waiter: reused handle %.0f ms, fresh %.0f ms\n", t_reused, t_fresh);
+    CHECK(t_reused < 3 * t_fresh + 20);
+    CloseHandle(ev2); CloseHandle(fresh); CloseHandle(ready);
+}
+
 static void CALLBACK apc(ULONG_PTR arg) { *(int *)arg = 1; }
 
 static void check_apc(void)
@@ -577,7 +612,11 @@ int main(int argc, char **argv)
     bench_processes();
     /* Last: Wine's handle cache keeps a reference that a thread killed while waiting never drops, so a reused
      * handle value isn't cached any more and every call on it asks the server; timings after this mean little. */
-    if (argc < 2 || strcmp(argv[1], "bench")) check_thread_death();
+    if (argc < 2 || strcmp(argv[1], "bench"))
+    {
+        check_thread_death();
+        check_cache_after_kill();
+    }
     printf(failures ? "PROBE sync FAILED (%d)\n" : "PROBE sync OK\n", failures);
     return failures ? 1 : 0;
 }
