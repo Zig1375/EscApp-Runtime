@@ -25,8 +25,9 @@ refuses a revision without one. Keep it current as you work:
   synchronization `tests/osync/run.sh`, `tests/sync/run.sh` and `tests/winetest/run.sh`.
 - Clean up after every task: Wine prefixes, test homes, unpacked packages and build trees take gigabytes each and
   have filled the disk before. Put them under one temporary folder per task (TMP_DIR for the tests), delete them as
-  soon as their checks are done and never leave them for later, even if the task is interrupted. Keep only
-  `wine/.cache/dl` (downloads) and the newest archives in `wine/dist`; never delete another session's folders.
+  soon as their checks are done and never leave them for later, even if the task is interrupted. Stop the task's
+  Wine processes (`wineserver -k` per prefix) first. Keep only `wine/.cache/dl` (downloads), the newest archives in
+  `wine/dist` and what the next step needs, and say what was kept and why; never delete another session's folders.
 - Never let Wine show a dialog: set `HKCU\Software\Wine\WineDbg ShowCrashDialog=dword:0` in a test prefix before
   running anything, and read crashes from the logs.
 
