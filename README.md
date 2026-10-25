@@ -11,7 +11,7 @@ WoW64, so 32-bit games need no 32-bit macOS code, and adds Wine Mono 11.3.0 and 
 Wine 11.20 asks for). The archive `escapp-wine-<wine>-<revision>.tar.xz` holds one folder, `wine/`, laid out as Wine
 installs itself (`bin/`, `lib/`, `share/`), with every license and this build script in `wine/licenses/`.
 
-Two patches are applied (`wine/patches/`):
+These patches are applied (`wine/patches/`):
 
 - `0001` exports winemac's `macdrv_functions` table, which [DXMT](https://github.com/3Shain/dxmt)
   (Direct3D 10/11 on Metal) uses to create its Metal view. Without it DXMT fails with "Failed to create metal view".
@@ -22,6 +22,11 @@ Two patches are applied (`wine/patches/`):
   live in memory shared with wineserver and are waited on and signalled inside the process with macOS's public
   `os_sync_wait_on_address`. Off unless wineserver starts with `WINEOSYNC=1`. Against stock Wine's wineserver path
   it is 9 to 26 times faster on our benchmarks.
+- `0004` lets the player stretch a game window that can't be resized (with `StretchWindows` next to
+  `EmulateModeset`): the window keeps its size for the game, and Wine scales the picture and the mouse by shrinking
+  the emulated display mode. It also fixes the Mac driver bugs this exposed (OpenGL drawn at a stale size or only
+  a corner of it, a Direct3D 9 hang, white bars around an emulated full screen, DXMT views not following their
+  window).
 
 Every download is pinned by SHA-256. Wine, Mono and Gecko come from WineHQ; the x86_64 libraries Wine loads
 (FreeType, GnuTLS, SDL2 and their dependencies) come unmodified from

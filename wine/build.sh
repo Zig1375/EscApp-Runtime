@@ -8,7 +8,8 @@
 # Why build Wine: DXMT (Direct3D 10/11 on Metal) needs winemac's `macdrv_functions` table, which stock Wine and
 # Gcenx's current builds don't export (DXMT then logs "Failed to create metal view"). patches/0001 adds it.
 # patches/0002 keeps 32-bit code under Rosetta 2 from crashing at random; patches/0003 adds osync, our in-process
-# synchronization (docs/osync.md; on with WINEOSYNC=1).
+# synchronization (docs/osync.md; on with WINEOSYNC=1). patches/0004 lets the player stretch a fixed-size game
+# window (StretchWindows): Wine scales it through the emulated display mode, and the game sees no resize.
 # Why Wine 11.20, a development release: it passes the same probes as 11.0 (DXVK, DXMT and WineD3D, 32- and
 # 64-bit) and carries ten months of fixes the stable 11.0 branch doesn't get. Development releases change every
 # two weeks and winemac's internals move with them (patches/0001 had to be redone between 11.0 and 11.20), so

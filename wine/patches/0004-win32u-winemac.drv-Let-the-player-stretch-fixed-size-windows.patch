@@ -1,0 +1,798 @@
+win32u, winemac.drv: Let the player stretch fixed-size windows.
+
+Many games draw into a window of one fixed size, with a title bar but no
+resizing border (Unity games by default). On a Mac that window can't be made
+bigger, and on a Retina screen a 1440x800 game takes half the screen.
+
+With StretchWindows (HKCU\Software\Wine\X11 Driver, next to EmulateModeset,
+which it needs) such a window becomes resizable on the Mac. When the player
+drags it, the window keeps its size for the program and win32u shrinks the
+emulated display mode instead, so that the window covers the new raw rect:
+the same virt -> raw mapping that EmulateModeset uses for full-screen games
+then stretches GDI, OpenGL, Vulkan and DXMT output and maps the mouse back.
+The program gets no WM_SIZE and no WM_DISPLAYCHANGE. The size the player chose
+is kept per window class under HKCU\Software\Wine\EscApp\Stretch; when the
+program sizes or shows the window itself, the scale is fitted to that size
+again, keeping the program's aspect ratio, never below one program pixel per
+screen pixel and never beyond the work area. A display mode the program set
+itself is left alone.
+
+winemac.drv keeps the aspect ratio while the player drags, sends no size-move
+messages for such a window, and snaps the Cocoa frame to the exact size when
+the drag ends, or at once after zoom or window tiling.
+
+Bugs this exposed, fixed here because stretching makes them common:
+- not every emulated mode works: the monitor DPI is a ratio of 16-bit numbers,
+  so the virtual size is the nearest one that reduces far enough;
+- win32u's framebuffer surface shares its client surface with the window
+  drawable, which could take the update flag first, so the blit kept the old
+  monitor size; it now reads the size at every present;
+- winemac.drv sized the GL backing of a raw surface (the framebuffer under
+  EmulateModeset) by its virtual rect, showing only a corner of the picture;
+- viewWillDraw updated pending GL contexts through OnMainThread on the main
+  thread itself and waited forever (Direct3D 9 games hung);
+- the black bars around an emulated full screen ignored Retina mode;
+- the client surface made for DXMT wasn't in win32u's list of used surfaces,
+  so its view never followed the window.
+
+diff --git a/dlls/win32u/opengl.c b/dlls/win32u/opengl.c
+index 64884c7..8d434cd 100644
+--- a/dlls/win32u/opengl.c
++++ b/dlls/win32u/opengl.c
+@@ -973,6 +973,10 @@ static void blit_framebuffer_surface( struct opengl_drawable *drawable )
+     BOOL compat = surface->root_context == root_compat;
+     float ramp_data[GAMMA_RAMP_SIZE * 4];
+ 
++    /* The window drawable shares this client surface and may have taken its update flag first: read the monitor
++     * size again, or a window stretched without a resize keeps being drawn at its old size. */
++    if (drawable->client) client_surface_get_monitor_size( drawable->client, &dst );
++
+     TRACE( "%s src %s dst %s fbo %u\n", debugstr_opengl_drawable( drawable ), wine_dbgstr_point( (POINT *)&src ),
+            wine_dbgstr_point( (POINT *)&dst ), drawable->read_fbo );
+ 
+diff --git a/dlls/win32u/sysparams.c b/dlls/win32u/sysparams.c
+index 7095e41..9d0b050 100644
+--- a/dlls/win32u/sysparams.c
++++ b/dlls/win32u/sysparams.c
+@@ -166,6 +166,7 @@ static UINT64 monitor_update_serial;
+ static pthread_mutex_t display_lock = PTHREAD_MUTEX_INITIALIZER;
+ 
+ BOOL emulate_modeset = FALSE;
++BOOL stretch_windows = FALSE;
+ BOOL decorated_mode = TRUE;
+ UINT64 thunk_lock_callback = 0;
+ 
+@@ -3206,6 +3207,268 @@ struct window_rects map_window_rects_virt_to_raw( struct window_rects rects, str
+     return rects;
+ }
+ 
++/* display_lock must be held */
++static void touch_source_registry( const struct source *source )
++{
++    char buffer[1024], name[64];
++    KEY_VALUE_PARTIAL_INFORMATION *value = (void *)buffer;
++    WCHAR nameW[64];
++
++    /* other processes reload the display config only when the video key was written after they last read it */
++    snprintf( name, sizeof(name), "\\Device\\Video%u", source->id );
++    if (!query_reg_ascii_value( video_key, name, value, sizeof(buffer) )) return;
++    asciiz_to_unicode( nameW, name );
++    set_reg_value( video_key, nameW, value->Type, value->Data, value->DataLength );
++}
++
++/* Most games with a fixed-size window are too small on a Mac screen, and can't be made bigger: they don't
++ * redraw at another size. When the player resizes such a window (StretchWindows, with EmulateModeset), the
++ * window keeps its size and the emulated display mode shrinks instead, so that the window covers the new raw
++ * rect. Everything else follows from the virt -> raw mapping that EmulateModeset already does for
++ * fullscreen games: surfaces are stretched, the cursor is mapped back, and the game never sees a resize.
++ *
++ * The size the player chose is the target for that window class, kept in the registry: when the game changes
++ * its window size itself (another resolution in its settings, back from fullscreen, the next start), the scale
++ * is fitted to the target again, keeping the game's aspect ratio. A game bigger than the target is shown at its
++ * own size. A display mode the game set itself is never touched. */
++
++struct stretch_target
++{
++    UINT width, height;                     /* raw size of the window the player chose */
++    UINT physical_width, physical_height;   /* raw display size then */
++};
++
++static const char stretch_keyA[] = "Software\\Wine\\EscApp\\Stretch";
++static const WCHAR stretch_modeW[] = {'M','o','d','e',0};
++static const WCHAR stretch_targetW[] = {'T','a','r','g','e','t',0};
++
++static HKEY open_stretch_key( HWND hwnd, BOOL create )
++{
++    WCHAR class_name[256];
++    UNICODE_STRING name = RTL_CONSTANT_STRING( class_name );
++    HKEY root, hkey = 0;
++    INT len;
++
++    if (!(root = reg_create_ascii_key( hkcu_key, stretch_keyA, 0, NULL ))) return 0;
++    if (!hwnd) return root;
++    name.MaximumLength = sizeof(class_name);
++    if ((len = NtUserGetClassName( hwnd, FALSE, &name )) > 0)
++    {
++        for (INT i = 0; i < len; i++) if (class_name[i] == '\\') class_name[i] = '_';
++        hkey = create ? reg_create_key( root, class_name, len * sizeof(WCHAR), 0, NULL )
++                      : reg_open_key( root, class_name, len * sizeof(WCHAR) );
++    }
++    NtClose( root );
++    return hkey;
++}
++
++static BOOL read_stretch_value( HWND hwnd, const WCHAR *name, void *data, UINT size )
++{
++    char buffer[offsetof(KEY_VALUE_PARTIAL_INFORMATION, Data[64])];
++    KEY_VALUE_PARTIAL_INFORMATION *value = (void *)buffer;
++    HKEY hkey;
++    BOOL ret;
++
++    if (!(hkey = open_stretch_key( hwnd, FALSE ))) return FALSE;
++    ret = query_reg_value( hkey, name, value, sizeof(buffer) ) && value->Type == REG_BINARY && value->DataLength == size;
++    if (ret) memcpy( data, value->Data, size );
++    NtClose( hkey );
++    return ret;
++}
++
++static void write_stretch_value( HWND hwnd, const WCHAR *name, const void *data, UINT size )
++{
++    HKEY hkey;
++
++    if (!(hkey = open_stretch_key( hwnd, TRUE ))) return;
++    set_reg_value( hkey, name, REG_BINARY, data, size );
++    NtClose( hkey );
++}
++
++/* display_lock must be held */
++static double source_stretch_scale( struct source *source )
++{
++    UINT num, den;
++    source_virt_to_raw_ratio( source, &num, &den );
++    return (double)num / den;
++}
++
++/* display_lock must be held; is the emulated mode the physical one, or one stretching set? */
++static BOOL source_mode_is_stretch( struct source *source )
++{
++    UINT mode[2];
++
++    if (source->current.dmPelsWidth == source->physical.dmPelsWidth &&
++        source->current.dmPelsHeight == source->physical.dmPelsHeight) return TRUE;
++    return read_stretch_value( 0, stretch_modeW, mode, sizeof(mode) ) &&
++           mode[0] == source->current.dmPelsWidth && mode[1] == source->current.dmPelsHeight;
++}
++
++/* display_lock must be held. Raw window size at scale 1, and the largest scale that keeps it in the work area. */
++static BOOL get_stretch_bounds( struct monitor *monitor, RECT virt, struct ratio dpi, double *width, double *height,
++                                double *max_scale )
++{
++    double scale = source_stretch_scale( monitor->source );
++    RECT raw = map_monitor_rect( monitor, virt, dpi, MDT_DEFAULT, no_dpi, MDT_RAW_DPI ), work = monitor->rc_work;
++
++    if (IsRectEmpty( &raw ) || IsRectEmpty( &work )) return FALSE;
++    *width = (raw.right - raw.left) / scale;
++    *height = (raw.bottom - raw.top) / scale;
++    *max_scale = min( (work.right - work.left) / *width, (work.bottom - work.top) / *height );
++    if (*max_scale < 1) *max_scale = 1;
++    return TRUE;
++}
++
++/* The monitor DPI is dpi * physical / virtual as a ratio of 16-bit numbers (make_ratio), so not every virtual
++ * size works: take the nearest one that reduces far enough. */
++static UINT fit_stretch_size( UINT dpi, UINT physical, double wanted )
++{
++    UINT size = wanted + 0.5;
++
++    for (UINT step = 0; step < 256; step++)
++    {
++        UINT candidates[2] = {size + step, size - step};
++        for (UINT i = 0; i < 2; i++)
++        {
++            UINT d, c = candidates[i];
++            if (!c || c > physical) continue;
++            d = gcd( dpi * physical, c );
++            if ((dpi * physical) / d < 65536 && c / d < 65536) return c;
++        }
++    }
++    return physical;
++}
++
++/* display_lock must be held; scale is raw pixels per game pixel, at least 1 */
++static BOOL set_stretch_scale( struct source *source, double scale )
++{
++    DEVMODEW mode = source->current;
++    UINT width = source->physical.dmPelsWidth, height = source->physical.dmPelsHeight, saved[2];
++    UINT dpi = source->dpi ? source->dpi : system_dpi;
++
++    if (scale > 1)
++    {
++        width = fit_stretch_size( dpi, width, width / scale );
++        height = fit_stretch_size( dpi, height, height / scale );
++    }
++    if (width == source->current.dmPelsWidth && height == source->current.dmPelsHeight) return FALSE;
++
++    TRACE( "mode %ux%u -> %ux%u, scale %.3f\n", (UINT)mode.dmPelsWidth, (UINT)mode.dmPelsHeight, width, height, scale );
++    mode.dmPelsWidth = width;
++    mode.dmPelsHeight = height;
++    if (!source_set_current_settings( source, &mode )) return FALSE;
++    source->current.dmPelsWidth = width;
++    source->current.dmPelsHeight = height;
++    saved[0] = width;
++    saved[1] = height;
++    write_stretch_value( 0, stretch_modeW, saved, sizeof(saved) );
++    touch_source_registry( source );
++    set_winstation_monitors( TRUE );
++    return TRUE;
++}
++
++static struct monitor *lock_stretch_monitor( RECT virt, struct ratio dpi )
++{
++    struct monitor *monitor;
++
++    if (!lock_display_devices( FALSE )) return NULL;
++    if ((monitor = get_monitor_from_rect( virt, MONITOR_DEFAULTTONEAREST, dpi, MDT_DEFAULT )) && monitor->source &&
++        (monitor->source->state_flags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP))
++        return monitor;
++    unlock_display_devices();
++    return NULL;
++}
++
++static BOOL get_primary_source_mode( DEVMODEW *mode );
++
++static void notify_stretch( BOOL changed )
++{
++    DEVMODEW mode = {.dmSize = sizeof(DEVMODEW)};
++
++    /* the desktop window follows the virtual screen; games get no WM_DISPLAYCHANGE, nothing changed for them */
++    if (changed && get_primary_source_mode( &mode ))
++        send_notify_message( get_desktop_window(), WM_DISPLAYCHANGE, mode.dmBitsPerPel,
++                             MAKELPARAM( mode.dmPelsWidth, mode.dmPelsHeight ), FALSE );
++}
++
++/* The player resized the window to the raw rect: stretch to it and remember it as the target. Returns FALSE if
++ * the window can't be stretched; the size the player asked for is then applied as usual. */
++BOOL stretch_display_for_window( HWND hwnd, RECT raw )
++{
++    struct ratio dpi = get_thread_dpi();
++    double width, height, max_scale, scale, scale_x, scale_y;
++    struct stretch_target target;
++    struct monitor *monitor;
++    struct source *source;
++    BOOL changed = FALSE, has_target = FALSE;
++    RECT virt;
++
++    if (!emulate_modeset || !stretch_windows) return FALSE;
++    if (!get_window_rect( hwnd, &virt, dpi ) || IsRectEmpty( &raw )) return FALSE;
++    if (!(monitor = lock_stretch_monitor( virt, dpi ))) return FALSE;
++    source = monitor->source;
++
++    /* a mode the game set itself stays; the window just keeps its size */
++    if (source_mode_is_stretch( source ) && get_stretch_bounds( monitor, virt, dpi, &width, &height, &max_scale ))
++    {
++        /* the player drags an edge or a corner: follow the side that changed more */
++        scale = source_stretch_scale( source );
++        scale_x = (raw.right - raw.left) / width;
++        scale_y = (raw.bottom - raw.top) / height;
++        scale = (scale_x > scale ? scale_x - scale : scale - scale_x) >= (scale_y > scale ? scale_y - scale : scale - scale_y)
++                ? scale_x : scale_y;
++        scale = max( 1, min( scale, max_scale ) );
++
++        target.width = width * scale + 0.5;
++        target.height = height * scale + 0.5;
++        target.physical_width = source->physical.dmPelsWidth;
++        target.physical_height = source->physical.dmPelsHeight;
++        TRACE( "hwnd %p virt %s raw %s, target %ux%u\n", hwnd, wine_dbgstr_rect( &virt ), wine_dbgstr_rect( &raw ),
++               target.width, target.height );
++        has_target = TRUE;
++        changed = set_stretch_scale( source, scale );
++    }
++    unlock_display_devices();
++
++    if (has_target) write_stretch_value( hwnd, stretch_targetW, &target, sizeof(target) );
++    notify_stretch( changed );
++    return TRUE;
++}
++
++/* The game sized or showed the window itself (virt rect, in dpi): fit the scale to the player's target again.
++ * Returns TRUE if the display mode changed. */
++BOOL restretch_display_for_window( HWND hwnd, RECT virt, struct ratio dpi )
++{
++    double width, height, max_scale, scale = 1;
++    struct stretch_target target;
++    struct monitor *monitor;
++    struct source *source;
++    BOOL changed = FALSE, has_target;
++
++    if (!emulate_modeset || !stretch_windows || IsRectEmpty( &virt )) return FALSE;
++    has_target = read_stretch_value( hwnd, stretch_targetW, &target, sizeof(target) ) &&
++                 target.physical_width && target.physical_height;
++    if (!(monitor = lock_stretch_monitor( virt, dpi ))) return FALSE;
++    source = monitor->source;
++
++    if (source_mode_is_stretch( source ) && get_stretch_bounds( monitor, virt, dpi, &width, &height, &max_scale ))
++    {
++        if (has_target)
++        {
++            /* the target in today's raw pixels, if the display (or Retina mode) changed since */
++            double target_width = (double)target.width * source->physical.dmPelsWidth / target.physical_width;
++            double target_height = (double)target.height * source->physical.dmPelsHeight / target.physical_height;
++            scale = max( 1, min( min( target_width / width, target_height / height ), max_scale ) );
++        }
++        TRACE( "hwnd %p virt %s, scale %.3f\n", hwnd, wine_dbgstr_rect( &virt ), scale );
++        changed = set_stretch_scale( source, scale );
++    }
++    unlock_display_devices();
++
++    notify_stretch( changed );
++    return changed;
++}
++
+ static struct ratio get_monitor_dpi( HMONITOR handle, UINT type, struct ratio *x, struct ratio *y )
+ {
+     struct ratio dpi = {system_dpi, 1};
+@@ -6083,6 +6346,8 @@ void sysparams_init(void)
+         decorated_mode = IS_OPTION_TRUE( buffer[0] );
+     if (!get_config_key( hkey, appkey, "EmulateModeset", buffer, sizeof(buffer) ))
+         emulate_modeset = IS_OPTION_TRUE( buffer[0] );
++    if (!get_config_key( hkey, appkey, "StretchWindows", buffer, sizeof(buffer) ))
++        stretch_windows = IS_OPTION_TRUE( buffer[0] );
+ 
+ #undef IS_OPTION_TRUE
+ 
+diff --git a/dlls/win32u/vulkan.c b/dlls/win32u/vulkan.c
+index 3265d74..3dc5674 100644
+--- a/dlls/win32u/vulkan.c
++++ b/dlls/win32u/vulkan.c
+@@ -1912,7 +1912,7 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
+      */
+     get_win_monitor_dpi( surface->hwnd, &raw_dpi );
+     if (get_surface_rect( surface->hwnd, &client_rect, raw_dpi ) &&
+-        !extents_equals( &create_info_host.imageExtent, &client_rect ) &&
++        (stretch_windows || !extents_equals( &create_info_host.imageExtent, &client_rect )) &&
+         instance->extensions.has_VK_EXT_surface_maintenance1 &&
+         physical_device->extensions.has_VK_KHR_swapchain_maintenance1)
+     {
+diff --git a/dlls/win32u/win32u_private.h b/dlls/win32u/win32u_private.h
+index 2c92515..b4b0d78 100644
+--- a/dlls/win32u/win32u_private.h
++++ b/dlls/win32u/win32u_private.h
+@@ -161,6 +161,9 @@ extern void track_scroll_bar( HWND hwnd, int scrollbar, POINT pt );
+ /* sysparams.c */
+ extern UINT system_dpi;
+ extern BOOL emulate_modeset;
++extern BOOL stretch_windows;
++extern BOOL stretch_display_for_window( HWND hwnd, RECT raw );
++extern BOOL restretch_display_for_window( HWND hwnd, RECT virt, struct ratio dpi );
+ extern BOOL decorated_mode;
+ extern UINT64 thunk_lock_callback;
+ extern HBRUSH get_55aa_brush(void);
+@@ -332,6 +335,7 @@ extern BOOL is_client_surface_window( struct client_surface *surface, HWND hwnd
+ extern void client_surface_update( struct client_surface *surface );
+ extern BOOL client_surface_set_color_space( struct client_surface *surface, VkColorSpaceKHR color_space );
+ extern BOOL client_surface_get_size( struct client_surface *surface, SIZE *virtual_size, SIZE *monitor_size );
++extern void client_surface_get_monitor_size( struct client_surface *surface, SIZE *monitor_size );
+ extern void use_window_client_surface( struct client_surface *surface, BOOL use );
+ extern struct client_surface *get_unused_client_surface( HWND hwnd, int format, BOOL raw );
+ extern HICON get_window_icon_info( HWND hwnd, UINT type, HICON icon, ICONINFO *ret );
+diff --git a/dlls/win32u/window.c b/dlls/win32u/window.c
+index 03ce398..7a96011 100644
+--- a/dlls/win32u/window.c
++++ b/dlls/win32u/window.c
+@@ -462,6 +462,15 @@ BOOL client_surface_set_color_space( struct client_surface *surface, VkColorSpac
+     return ret;
+ }
+ 
++/* the monitor size alone, leaving the update flag to client_surface_get_size */
++void client_surface_get_monitor_size( struct client_surface *surface, SIZE *monitor_size )
++{
++    pthread_mutex_lock( &surfaces_lock );
++    monitor_size->cx = max( 1, surface->monitor_rect.right - surface->monitor_rect.left );
++    monitor_size->cy = max( 1, surface->monitor_rect.bottom - surface->monitor_rect.top );
++    pthread_mutex_unlock( &surfaces_lock );
++}
++
+ BOOL client_surface_get_size( struct client_surface *surface, SIZE *virtual_size, SIZE *monitor_size )
+ {
+     BOOL updated;
+@@ -2306,6 +2315,28 @@ HICON get_window_icon_info( HWND hwnd, UINT type, HICON icon, ICONINFO *ret )
+     return NULL;
+ }
+ 
++/* move a stretched window back on the work area, as far as it fits; returns the offset */
++static POINT keep_on_work_area( RECT *rect, struct ratio dpi )
++{
++    MONITORINFO info = monitor_info_from_rect( *rect, dpi );
++    POINT offset = {0, 0};
++
++    if (rect->right > info.rcWork.right) offset.x = info.rcWork.right - rect->right;
++    if (rect->left + offset.x < info.rcWork.left) offset.x = info.rcWork.left - rect->left;
++    if (rect->bottom > info.rcWork.bottom) offset.y = info.rcWork.bottom - rect->bottom;
++    if (rect->top + offset.y < info.rcWork.top) offset.y = info.rcWork.top - rect->top;
++    OffsetRect( rect, offset.x, offset.y );
++    return offset;
++}
++
++/* a fixed-size toplevel window with a title bar to drag: see stretch_display_for_window */
++static BOOL is_stretchable_style( DWORD style )
++{
++    if (!stretch_windows || !emulate_modeset) return FALSE;
++    if ((style & WS_CAPTION) != WS_CAPTION) return FALSE;
++    return !(style & (WS_THICKFRAME | WS_CHILD | WS_MAXIMIZE | WS_MINIMIZE));
++}
++
+ static BOOL is_fullscreen( const MONITORINFO *info, const RECT *rect )
+ {
+     return rect->left <= info->rcMonitor.left && rect->right >= info->rcMonitor.right &&
+@@ -2413,20 +2444,21 @@ static BOOL apply_window_pos( HWND hwnd, HWND insert_after, UINT swp_flags, stru
+         }
+ 
+         if (win->dwStyle & WS_THICKFRAME) swp_flags |= WINE_SWP_RESIZABLE;
++        else if (!is_child && is_stretchable_style( win->dwStyle )) swp_flags |= WINE_SWP_RESIZABLE | WINE_SWP_STRETCH;
+         if (is_child) monitor_rects = map_dpi_window_rects( *new_rects, dpi, raw_dpi );
+         else if (!IsRectEmpty( &win->present_rect ))
+         {
+             MONITORINFO monitor_info = monitor_info_from_rect( new_rects->window, dpi );
+             struct window_rects rects = { monitor_info.rcMonitor, monitor_info.rcMonitor, monitor_info.rcMonitor };
+             swp_flags |= WINE_SWP_FULLSCREEN;
+-            swp_flags &= ~WINE_SWP_RESIZABLE;
++            swp_flags &= ~(WINE_SWP_RESIZABLE | WINE_SWP_STRETCH);
+             monitor_rects = map_window_rects_virt_to_raw( rects, dpi );
+         }
+         else
+         {
+             MONITORINFO monitor_info = monitor_info_from_rect( new_rects->window, dpi );
+             if (is_fullscreen( &monitor_info, &new_rects->visible )) swp_flags |= WINE_SWP_FULLSCREEN;
+-            if (is_fullscreen( &monitor_info, &new_rects->window )) swp_flags &= ~WINE_SWP_RESIZABLE;
++            if (is_fullscreen( &monitor_info, &new_rects->window )) swp_flags &= ~(WINE_SWP_RESIZABLE | WINE_SWP_STRETCH);
+             monitor_rects = map_window_rects_virt_to_raw( *new_rects, dpi );
+         }
+     }
+@@ -4105,7 +4137,7 @@ BOOL set_window_pos( WINDOWPOS *winpos, int parent_x, int parent_y )
+     struct window_surface *surface;
+     struct window_rects old_rects, new_rects;
+     UINT orig_flags, context;
+-    BOOL ret = FALSE;
++    BOOL ret = FALSE, stretchable, stretched = FALSE;
+ 
+     orig_flags = winpos->flags;
+ 
+@@ -4150,11 +4182,56 @@ BOOL set_window_pos( WINDOWPOS *winpos, int parent_x, int parent_y )
+ 
+     context = set_thread_dpi_awareness_context( get_window_dpi_awareness_context( winpos->hwnd ));
+ 
++    /* The game sizes a stretchable window itself (another resolution in its settings): fit the stretching to the
++     * player's target for the new size first, or the size would be cut to the virtual screen of the old scale.
++     * Unless the game moves it too, the window stays where the player sees it. */
++    stretchable = stretch_windows && NtUserGetAncestor( winpos->hwnd, GA_PARENT ) == get_desktop_window() &&
++                  is_stretchable_style( get_window_long( winpos->hwnd, GWL_STYLE ) );
++    if (stretchable && !(winpos->flags & SWP_NOSIZE))
++    {
++        RECT rect, raw;
++
++        if (get_window_rect( winpos->hwnd, &rect, get_thread_dpi() ))
++        {
++            raw = map_rect_virt_to_raw( rect, get_thread_dpi() );
++            if (!(winpos->flags & SWP_NOMOVE)) OffsetRect( &rect, winpos->x - rect.left, winpos->y - rect.top );
++            rect.right = rect.left + winpos->cx;
++            rect.bottom = rect.top + winpos->cy;
++            if ((stretched = restretch_display_for_window( winpos->hwnd, rect, get_thread_dpi() )) &&
++                (winpos->flags & SWP_NOMOVE))
++            {
++                rect = map_rect_raw_to_virt( raw, get_thread_dpi() );
++                winpos->x = rect.left;
++                winpos->y = rect.top;
++                winpos->flags &= ~SWP_NOMOVE;
++            }
++        }
++    }
++
+     if (!calc_winpos( winpos, &old_rects, &new_rects )) goto done;
+ 
+     /* Fix redundant flags */
+     if (!fixup_swp_flags( winpos, &old_rects.window, parent_x, parent_y )) goto done;
+ 
++    /* the game showed a stretchable window, or changed its style: fit the stretching to the player's target
++     * again, and keep the window on the work area if the virtual screen got smaller */
++    if (stretchable && (!(winpos->flags & SWP_NOSIZE) || (winpos->flags & (SWP_SHOWWINDOW | SWP_FRAMECHANGED))) &&
++        restretch_display_for_window( winpos->hwnd, new_rects.window, get_thread_dpi() ))
++        stretched = TRUE;
++    if (stretched)
++    {
++        POINT offset = keep_on_work_area( &new_rects.window, get_thread_dpi() );
++
++        if (offset.x || offset.y)
++        {
++            OffsetRect( &new_rects.client, offset.x, offset.y );
++            OffsetRect( &new_rects.visible, offset.x, offset.y );
++            winpos->x = new_rects.window.left;
++            winpos->y = new_rects.window.top;
++            winpos->flags &= ~SWP_NOMOVE;
++        }
++    }
++
+     if((winpos->flags & (SWP_NOZORDER | SWP_HIDEWINDOW | SWP_SHOWWINDOW)) != SWP_NOZORDER)
+     {
+         if (NtUserGetAncestor( winpos->hwnd, GA_PARENT ) == get_desktop_window())
+@@ -6244,6 +6321,24 @@ static BOOL set_raw_window_pos( HWND hwnd, RECT rect, UINT flags, BOOL internal
+ {
+     TRACE( "hwnd %p, rect %s, flags %#x, internal %u\n", hwnd, wine_dbgstr_rect(&rect), flags, internal );
+ 
++    /* a stretchable window keeps its size; the mapping changes, so its position must be mapped again, and the
++     * stretched window must stay on the screen (Cocoa won't take a frame that doesn't fit) */
++    if (!internal && !(flags & SWP_NOSIZE) && NtUserGetAncestor( hwnd, GA_PARENT ) == get_desktop_window() &&
++        is_stretchable_style( get_window_long( hwnd, GWL_STYLE ) ) && stretch_display_for_window( hwnd, rect ))
++    {
++        RECT virt;
++
++        flags = (flags | SWP_NOSIZE) & ~SWP_NOMOVE;
++        rect = map_rect_raw_to_virt( rect, get_thread_dpi() );
++        if (get_window_rect( hwnd, &virt, get_thread_dpi() ))
++        {
++            OffsetRect( &virt, rect.left - virt.left, rect.top - virt.top );
++            keep_on_work_area( &virt, get_thread_dpi() );
++            rect = virt;
++        }
++        return NtUserSetWindowPos( hwnd, 0, rect.left, rect.top, 0, 0, flags );
++    }
++
+     rect = map_rect_raw_to_virt( rect, get_thread_dpi() );
+ 
+     if (internal)
+diff --git a/dlls/winemac.drv/cocoa_opengl.m b/dlls/winemac.drv/cocoa_opengl.m
+index c15aefe..43f9713 100644
+--- a/dlls/winemac.drv/cocoa_opengl.m
++++ b/dlls/winemac.drv/cocoa_opengl.m
+@@ -308,6 +308,10 @@ void macdrv_update_opengl_context(WineOpenGLContext *context)
+                 [context clearDrawableLeavingSurfaceOnScreen];
+                 context.view = view;
+             }
++            /* viewWillDraw updates pending contexts on the main thread, which would wait for itself in
++               OnMainThread (seen with OpenGL games whose window is stretched while they draw) */
++            else if ([NSThread isMainThread])
++                [context update];
+             else OnMainThread(^{
+                 [context update];
+             });
+diff --git a/dlls/winemac.drv/cocoa_window.m b/dlls/winemac.drv/cocoa_window.m
+index e15f708..46c662f 100644
+--- a/dlls/winemac.drv/cocoa_window.m
++++ b/dlls/winemac.drv/cocoa_window.m
+@@ -3376,6 +3376,8 @@ void macdrv_set_window_mask(WineWindow *window, CGRect rect)
+ {
+ @autoreleasepool
+ {
++    /* the rect is in Wine's pixels; with Retina mode on, the content view is in points */
++    rect = cgrect_mac_from_win(rect);
+     OnMainThread(^{
+         [window setMask:rect];
+     });
+diff --git a/dlls/winemac.drv/dxmt.c b/dlls/winemac.drv/dxmt.c
+index 7719b6e..8ce6636 100644
+--- a/dlls/winemac.drv/dxmt.c
++++ b/dlls/winemac.drv/dxmt.c
+@@ -105,6 +105,30 @@ void macdrv_dxmt_destroy_window(HWND hwnd)
+     }
+ }
+ 
++/***********************************************************************
++ *              macdrv_dxmt_update_window
++ *
++ * Win32u keeps only the client surfaces that GL or Vulkan use in step with
++ * their window. The one made for DXMT is updated here, after the window
++ * moved or changed size (or a stretched window changed scale), so that its
++ * Cocoa view, and DXMT's Metal view inside it, cover the client area.
++ */
++void macdrv_dxmt_update_window(HWND hwnd)
++{
++    struct macdrv_client_surface *surface = NULL;
++
++    pthread_mutex_lock(&dxmt_mutex);
++    if (dxmt_surfaces && (surface = (struct macdrv_client_surface *)CFDictionaryGetValue(dxmt_surfaces, hwnd)))
++        client_surface_add_ref(&surface->client);
++    pthread_mutex_unlock(&dxmt_mutex);
++
++    if (surface)
++    {
++        client_surface_present(&surface->client);
++        client_surface_release(&surface->client);
++    }
++}
++
+ static struct dxmt_win_data *dxmt_get_win_data(HWND hwnd)
+ {
+     struct macdrv_client_surface *surface;
+diff --git a/dlls/winemac.drv/macdrv.h b/dlls/winemac.drv/macdrv.h
+index 5e5904c..bd30be1 100644
+--- a/dlls/winemac.drv/macdrv.h
++++ b/dlls/winemac.drv/macdrv.h
+@@ -242,6 +242,7 @@ extern void macdrv_ime_set_text(HWND hwnd, CFStringRef text, bool complete,
+     unsigned int        per_pixel_alpha : 1;    /* is window using per-pixel alpha? */
+     unsigned int        minimized : 1;          /* is window minimized? */
+     unsigned int        fullscreen : 1;         /* is the window visible rect fullscreen? (unrelated to native AppKit/Cocoa fullscreen) */
++    unsigned int        stretch : 1;            /* does resizing stretch the window? (WINE_SWP_STRETCH) */
+ };
+ 
+ struct macdrv_client_surface
+@@ -254,6 +255,7 @@ extern void macdrv_ime_set_text(HWND hwnd, CFStringRef text, bool complete,
+ extern struct macdrv_client_surface *impl_from_client_surface(struct client_surface *client);
+ extern bool macdrv_client_surface_acquire_metal_swapchain(struct macdrv_client_surface *surface);
+ extern void macdrv_dxmt_destroy_window(HWND hwnd);
++extern void macdrv_dxmt_update_window(HWND hwnd);
+ 
+ extern struct macdrv_win_data *get_win_data(HWND hwnd);
+ extern void release_win_data(struct macdrv_win_data *data);
+diff --git a/dlls/winemac.drv/opengl.c b/dlls/winemac.drv/opengl.c
+index 58de048..151b567 100644
+--- a/dlls/winemac.drv/opengl.c
++++ b/dlls/winemac.drv/opengl.c
+@@ -1147,7 +1147,8 @@ static void macdrv_context_select_drawable(struct macdrv_context *context, struc
+     if (drawable && drawable->client)
+     {
+         struct macdrv_client_surface *surface = impl_from_client_surface(drawable->client);
+-        RECT rect = surface->client.virtual_rect;
++        /* a raw surface (win32u's framebuffer under EmulateModeset) is drawn at the window's physical size */
++        RECT rect = surface->client.raw ? surface->client.monitor_rect : surface->client.virtual_rect;
+         macdrv_make_context_current(context->context, surface->cocoa_view, cgrect_from_rect(rect));
+         return;
+     }
+diff --git a/dlls/winemac.drv/window.c b/dlls/winemac.drv/window.c
+index 39fab9f..d3c99b8 100644
+--- a/dlls/winemac.drv/window.c
++++ b/dlls/winemac.drv/window.c
+@@ -88,7 +88,10 @@ static struct macdrv_window_features get_cocoa_window_features(struct macdrv_win
+     if (ex_style & WS_EX_NOACTIVATE) wf.prevents_app_activation = TRUE;
+     if (EqualRect(&data->rects.window, &data->rects.visible)) return wf;
+ 
+-    return get_window_features_for_style(style, ex_style, data->shaped);
++    wf = get_window_features_for_style(style, ex_style, data->shaped);
++    /* a fixed-size game window the player may stretch; win32u keeps its size for the game */
++    if (data->stretch && !data->shaped) wf.resizable = wf.shadow = TRUE;
++    return wf;
+ }
+ 
+ 
+@@ -1646,6 +1649,7 @@ void macdrv_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UINT
+ 
+     old_rects = data->rects;
+     data->rects = *new_rects;
++    data->stretch = !!(swp_flags & WINE_SWP_STRETCH);
+ 
+     TRACE("win %p/%p new_rects %s style %08x flags %08x surface %p\n", hwnd, data->cocoa_window,
+           debugstr_window_rects(new_rects), new_style, swp_flags, surface);
+@@ -1692,6 +1696,7 @@ void macdrv_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UINT
+ 
+ done:
+     release_win_data(data);
++    macdrv_dxmt_update_window(hwnd);
+ }
+ 
+ 
+@@ -1737,7 +1742,7 @@ void macdrv_window_frame_changed(HWND hwnd, const macdrv_event *event)
+     RECT rect;
+     UINT flags = SWP_NOACTIVATE | SWP_NOZORDER;
+     int width, height;
+-    BOOL being_dragged;
++    BOOL being_dragged, stretch;
+ 
+     if (!hwnd) return;
+     if (!(data = get_win_data(hwnd))) return;
+@@ -1773,18 +1778,28 @@ void macdrv_window_frame_changed(HWND hwnd, const macdrv_event *event)
+               data->rects.window.bottom - data->rects.window.top, width, height);
+ 
+     being_dragged = data->drag_event != NULL;
++    stretch = data->stretch;
+     release_win_data(data);
+ 
+     if (event->window_frame_changed.fullscreen)
+         flags |= SWP_NOSENDCHANGING;
+     if (!(flags & SWP_NOSIZE) || !(flags & SWP_NOMOVE))
+     {
+-        bool send_sizemove = !event->window_frame_changed.in_resize && !being_dragged && !event->window_frame_changed.skip_size_move_loop;
++        /* a stretched window doesn't change size for the game, so it gets no size-move loop either */
++        bool send_sizemove = !event->window_frame_changed.in_resize && !being_dragged && !event->window_frame_changed.skip_size_move_loop && !stretch;
+         if (send_sizemove)
+             send_message(hwnd, WM_ENTERSIZEMOVE, 0, 0);
+         NtUserSetRawWindowPos(hwnd, rect, flags, FALSE);
+         if (send_sizemove)
+             send_message(hwnd, WM_EXITSIZEMOVE, 0, 0);
++
++        /* Zoom, window tiling or another app resized a stretched window: no live resize ends to snap the Cocoa
++           frame to the game's aspect ratio, so do it now. */
++        if (stretch && !(flags & SWP_NOSIZE) && !event->window_frame_changed.in_resize && (data = get_win_data(hwnd)))
++        {
++            sync_window_position(data, SWP_NOZORDER, NULL);
++            release_win_data(data);
++        }
+     }
+ }
+ 
+@@ -1955,7 +1970,22 @@ void macdrv_window_brought_forward(HWND hwnd)
+  */
+ void macdrv_window_resize_ended(HWND hwnd)
+ {
++    struct macdrv_win_data *data;
++
+     TRACE("hwnd %p\n", hwnd);
++
++    /* During the resize the Cocoa frame leads. A stretched window's size is rounded to the new display mode,
++       so give the Cocoa window that exact size now. */
++    if ((data = get_win_data(hwnd)))
++    {
++        if (data->stretch)
++        {
++            sync_window_position(data, SWP_NOZORDER, NULL);
++            release_win_data(data);
++            return;
++        }
++        release_win_data(data);
++    }
+     send_message(hwnd, WM_EXITSIZEMOVE, 0, 0);
+ }
+ 
+@@ -2140,6 +2170,32 @@ bool query_resize_size(HWND hwnd, macdrv_query *query)
+ 
+     if (!data) return false;
+ 
++    if (data->stretch)
++    {
++        /* keep the game's aspect ratio, following the side the player drags more */
++        int width0 = data->rects.visible.right - data->rects.visible.left;
++        int height0 = data->rects.visible.bottom - data->rects.visible.top;
++        int width, height;
++
++        rect = rect_from_cgrect(query->resize_size.rect);
++        width = rect.right - rect.left;
++        height = rect.bottom - rect.top;
++        if (width0 > 0 && height0 > 0)
++        {
++            if ((long long)abs(width - width0) * height0 >= (long long)abs(height - height0) * width0)
++                height = (long long)width * height0 / width0;
++            else
++                width = (long long)height * width0 / height0;
++            if (query->resize_size.from_left) rect.left = rect.right - width;
++            else rect.right = rect.left + width;
++            if (query->resize_size.from_top) rect.top = rect.bottom - height;
++            else rect.bottom = rect.top + height;
++            query->resize_size.rect = cgrect_from_rect(rect);
++        }
++        release_win_data(data);
++        return true;
++    }
++
+     rect = rect_from_cgrect(query->resize_size.rect);
+     rect = window_rect_from_visible(&data->rects, rect);
+ 
+@@ -2174,10 +2230,20 @@ bool query_resize_size(HWND hwnd, macdrv_query *query)
+  */
+ bool query_resize_start(HWND hwnd)
+ {
++    struct macdrv_win_data *data;
++    BOOL stretch = FALSE;
++
+     TRACE("hwnd %p\n", hwnd);
+ 
+     NtUserClipCursor(NULL);
+ 
++    if ((data = get_win_data(hwnd)))
++    {
++        stretch = data->stretch;
++        release_win_data(data);
++    }
++    if (stretch) return true;
++
+     sync_window_min_max_info(hwnd);
+     send_message(hwnd, WM_ENTERSIZEMOVE, 0, 0);
+ 
+diff --git a/include/wine/gdi_driver.h b/include/wine/gdi_driver.h
+index 4d7d71c..0ac7c79 100644
+--- a/include/wine/gdi_driver.h
++++ b/include/wine/gdi_driver.h
+@@ -361,6 +361,7 @@ struct gdi_device_manager
+ #define WINE_DM_UNSUPPORTED 0x80000000
+ #define WINE_SWP_FULLSCREEN 0x80000000
+ #define WINE_SWP_RESIZABLE  0x40000000
++#define WINE_SWP_STRETCH    0x20000000 /* resizing stretches the window, its size stays */
+ 
+ struct vulkan_driver_funcs;
+ struct opengl_driver_funcs;
