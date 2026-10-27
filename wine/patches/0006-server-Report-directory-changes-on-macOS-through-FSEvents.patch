@@ -1,0 +1,626 @@
+server: Report directory changes on macOS through FSEvents.
+
+Wine learns about changes in a directory from inotify, which macOS doesn't
+have, so on a Mac ReadDirectoryChangesW never completed. Programs that talk
+to a helper through files in a watched folder waited for nothing: the Epic
+Games Launcher prepares a game's install folder in a second, elevated copy of
+itself, which reports back by writing a file into such a folder; the launcher
+never saw the file and gave the install up after 50 seconds (DP-06), and the
+player saw the install dialog close with nothing downloading.
+
+On macOS wineserver now watches each directory a program waits on with an
+FSEvents stream. FSEvents calls back on a dispatch queue of its own, so the
+new fsevents.c only queues the events and wakes the poll loop through a pipe;
+change.c matches them to the waiting directories on the server thread, drops
+what lies below a watch without subtree, and turns FSEvents' flags into
+added, removed, renamed (old and new name paired) and modified records.
+Dropped events wake the program without data, which it gets as
+STATUS_NOTIFY_ENUM_DIR.
+
+FSEvents' flags pile up: a file created a few seconds ago comes as "created"
+with every later write, a renamed one as "renamed", and a folder removed soon
+after its creation as created and removed. Whether the item still exists
+decides whether it went away, and each watch remembers the items (name and
+inode, the newest 1024) it has announced, so that a write into a new file is
+a modification and not the file being added again, as on Windows.
+
+Wine's kernel32:change and ntdll:change tests go from 108 failures to 14 on
+macOS. The rest wait 0 or 100 ms right after a change, sooner than FSEvents
+reports through fseventsd, or get a removal their directory saw just before
+the watch began.
+
+diff --git a/server/Makefile.in b/server/Makefile.in
+index ae28cfe..6992bf6 100644
+--- a/server/Makefile.in
++++ b/server/Makefile.in
+@@ -16,6 +16,7 @@ SOURCES = \
+ 	event.c \
+ 	fd.c \
+ 	file.c \
++	fsevents.c \
+ 	handle.c \
+ 	hook.c \
+ 	inproc_sync.c \
+@@ -53,6 +54,6 @@ SOURCES = \
+ 	winstation.c
+ 
+ UNIX_CFLAGS = $(INOTIFY_CFLAGS)
+-UNIX_LIBS   = $(LDEXECFLAGS) $(RT_LIBS) $(INOTIFY_LIBS) $(PROCSTAT_LIBS)
++UNIX_LIBS   = $(LDEXECFLAGS) $(RT_LIBS) $(INOTIFY_LIBS) $(PROCSTAT_LIBS) $(CORESERVICES_LIBS)
+ 
+ unicode_EXTRADEFS = -DBINDIR="\"${bindir}\"" -DDATADIR="\"${datadir}\""
+diff --git a/server/change.c b/server/change.c
+index 37fa946..58d019e 100644
+--- a/server/change.c
++++ b/server/change.c
+@@ -35,6 +35,8 @@
+ #include <poll.h>
+ #ifdef HAVE_SYS_INOTIFY_H
+ #include <sys/inotify.h>
++#elif defined(__APPLE__)
++#include "fsevents.h"
+ #endif
+ 
+ #include "ntstatus.h"
+@@ -68,6 +70,7 @@
+ struct inode;
+ 
+ static void free_inode( struct inode *inode );
++static void dir_remove_watch( struct dir *dir );
+ 
+ static struct fd *inotify_fd;
+ 
+@@ -94,6 +97,13 @@ struct dir
+     struct process *client_process;  /* client process that has a cache for this directory */
+     int             client_entry;    /* entry in client process cache */
+     struct list    kernel_object;    /* list of kernel object pointers */
++#if !defined(HAVE_SYS_INOTIFY_H) && defined(__APPLE__)
++    void          *watch;    /* FSEvents watch */
++    unsigned int   watch_id; /* id its events carry */
++    char          *watch_path; /* path it watches, without a trailing slash */
++    struct list    known;    /* items announced as added or renamed to, newest first */
++    unsigned int   known_count;
++#endif
+ };
+ 
+ static struct fd *dir_get_fd( struct object *obj );
+@@ -417,6 +427,7 @@ static void dir_destroy( struct object *obj )
+ 
+     if (dir->filter)
+         remove_change( dir );
++    dir_remove_watch( dir );
+ 
+     if (dir->inode)
+     {
+@@ -1042,6 +1053,10 @@ static char *get_basename( const char *link )
+     return name;
+ }
+ 
++static void dir_remove_watch( struct dir *dir )
++{
++}
++
+ static void dir_add_to_existing_notify( struct dir *dir )
+ {
+     struct inode *inode, *parent;
+@@ -1096,6 +1111,260 @@ static void dir_add_to_existing_notify( struct dir *dir )
+     free( link );
+ }
+ 
++#elif defined(__APPLE__)
++
++/* FSEvents support
++ *
++ * macOS has no inotify, so ReadDirectoryChangesW used to wait forever. The Epic Games Launcher prepares a game's
++ * install folder in a second, elevated copy of itself, which reports back by writing a file into a folder the
++ * launcher watches; the launcher never heard of it and gave the install up after 50 seconds (error DP-06).
++ *
++ * Each watching directory gets a stream of its own (fsevents.c). FSEvents always watches the whole tree and gives
++ * full paths, so a watch without subtree drops what happens below its own entries.
++ *
++ * FSEvents' flags pile up: a file created a few seconds ago comes as "created" with every later write, a renamed
++ * one as "renamed", and one removed soon after its creation as created and removed. Whether the item still exists
++ * decides whether it went away, and each watch remembers the items (name and inode) it has announced, so that a
++ * write into a new file is a modification, not the file being added again. */
++
++#define MAX_KNOWN 1024  /* items announced per watch that are remembered; beyond, the oldest may be announced again */
++
++struct known_item
++{
++    struct list entry;
++    ino_t       ino;
++    char        name[1];
++};
++
++static struct fd *fsevents_fd;
++static unsigned int last_watch_id;
++static unsigned int last_cookie;
++
++static int fsevents_get_poll_events( struct fd *fd );
++static void fsevents_poll_event( struct fd *fd, int event );
++
++static const struct fd_ops fsevents_fd_ops =
++{
++    .get_poll_events = fsevents_get_poll_events,
++    .poll_event      = fsevents_poll_event,
++};
++
++static int fsevents_get_poll_events( struct fd *fd )
++{
++    return POLLIN;
++}
++
++static unsigned int new_cookie( void )
++{
++    if (!++last_cookie) ++last_cookie;  /* 0 means "paired" to read_change */
++    return last_cookie;
++}
++
++static struct dir *dir_from_watch( unsigned int id )
++{
++    struct dir *dir;
++
++    LIST_FOR_EACH_ENTRY( dir, &change_list, struct dir, entry )
++        if (dir->watch && dir->watch_id == id) return dir;
++    return NULL;
++}
++
++static void fsevents_do_change_notify( struct dir *dir, unsigned int filter, unsigned int action,
++                                       unsigned int cookie, const char *relpath )
++{
++    struct change_record *record;
++
++    if (!(filter & dir->filter)) return;
++
++    if (dir->want_data)
++    {
++        size_t len = strlen( relpath );
++        if (!(record = malloc( offsetof( struct change_record, event.name[len] ) ))) return;
++        record->cookie = cookie;
++        record->event.action = action;
++        memcpy( record->event.name, relpath, len );
++        record->event.len = len;
++        list_add_tail( &dir->change_records, &record->entry );
++    }
++
++    fd_async_wake_up( dir->fd, ASYNC_TYPE_WAIT, STATUS_ALERTED );
++}
++
++static struct known_item *find_known( struct dir *dir, const char *name )
++{
++    struct known_item *item;
++
++    LIST_FOR_EACH_ENTRY( item, &dir->known, struct known_item, entry )
++        if (!strcmp( item->name, name )) return item;
++    return NULL;
++}
++
++static void forget_known( struct dir *dir, struct known_item *item )
++{
++    list_remove( &item->entry );
++    dir->known_count--;
++    free( item );
++}
++
++static void add_known( struct dir *dir, const char *name, ino_t ino )
++{
++    struct known_item *item;
++    size_t len = strlen( name );
++
++    if ((item = find_known( dir, name ))) forget_known( dir, item );
++    if (dir->known_count == MAX_KNOWN)
++        forget_known( dir, LIST_ENTRY( list_tail( &dir->known ), struct known_item, entry ) );
++    if (!(item = malloc( offsetof( struct known_item, name[len + 1] ) ))) return;
++    item->ino = ino;
++    memcpy( item->name, name, len + 1 );
++    list_add_head( &dir->known, &item->entry );
++    dir->known_count++;
++}
++
++/* renamed_watch and renamed_cookie pair a rename's old name with the new name that follows it in the same batch */
++static void fsevents_handle( const struct fsevent *event, unsigned int *renamed_watch, unsigned int *renamed_cookie )
++{
++    unsigned int name_filter, filter = 0, cookie;
++    struct known_item *item;
++    struct dir *dir;
++    const char *relpath;
++    struct stat st;
++    size_t len;
++    int exists, known;
++
++    if (!(dir = dir_from_watch( event->watch ))) return;  /* closed meanwhile */
++
++    cookie = *renamed_watch == event->watch ? *renamed_cookie : 0;
++    *renamed_cookie = 0;
++
++    if (event->flags & FSE_RESCAN)
++    {
++        /* woken without data, the program is told to read the directory again (STATUS_NOTIFY_ENUM_DIR) */
++        fd_async_wake_up( dir->fd, ASYNC_TYPE_WAIT, STATUS_ALERTED );
++        return;
++    }
++
++    len = strlen( dir->watch_path );
++    if (strncmp( event->path, dir->watch_path, len ) || event->path[len] != '/' || !event->path[len + 1]) return;
++    relpath = event->path + len + 1;
++    if (!dir->subtree && strchr( relpath, '/' )) return;
++
++    exists = !lstat( event->path, &st );
++    if (exists ? S_ISDIR( st.st_mode ) : (event->flags & FSE_DIR) != 0)
++        name_filter = FILE_NOTIFY_CHANGE_DIR_NAME;
++    else
++        name_filter = FILE_NOTIFY_CHANGE_FILE_NAME;
++
++    item = find_known( dir, relpath );
++    if (!exists)
++    {
++        /* gone before it was announced: it came and went in one report */
++        if (!item && (event->flags & FSE_CREATED))
++            fsevents_do_change_notify( dir, name_filter | FILE_NOTIFY_CHANGE_CREATION, FILE_ACTION_ADDED, 0,
++                                       relpath );
++        if (item) forget_known( dir, item );
++        if (event->flags & FSE_REMOVED)
++            fsevents_do_change_notify( dir, name_filter, FILE_ACTION_REMOVED, 0, relpath );
++        else if (event->flags & FSE_RENAMED)
++        {
++            *renamed_watch = event->watch;
++            *renamed_cookie = new_cookie();
++            fsevents_do_change_notify( dir, name_filter, FILE_ACTION_RENAMED_OLD_NAME, *renamed_cookie, relpath );
++        }
++        return;
++    }
++    known = item && item->ino == st.st_ino;
++
++    if ((event->flags & FSE_RENAMED) && !known)
++    {
++        /* a new name without its old one in this tree comes from outside: read_change makes it "added" */
++        add_known( dir, relpath, st.st_ino );
++        fsevents_do_change_notify( dir, name_filter, FILE_ACTION_RENAMED_NEW_NAME, cookie ? cookie : new_cookie(),
++                                   relpath );
++        return;
++    }
++    if ((event->flags & FSE_CREATED) && !known)
++    {
++        add_known( dir, relpath, st.st_ino );
++        fsevents_do_change_notify( dir, name_filter | FILE_NOTIFY_CHANGE_CREATION, FILE_ACTION_ADDED, 0, relpath );
++        /* creating an item sets its times and may truncate it; only data written into a new file is a change */
++        if (!S_ISREG( st.st_mode ) || !st.st_size) return;
++    }
++
++    if (event->flags & FSE_MODIFIED)
++        filter |= FILE_NOTIFY_CHANGE_SIZE | FILE_NOTIFY_CHANGE_LAST_WRITE | FILE_NOTIFY_CHANGE_LAST_ACCESS;
++    if (event->flags & FSE_ATTRIB)  /* this includes changed times */
++        filter |= FILE_NOTIFY_CHANGE_ATTRIBUTES | FILE_NOTIFY_CHANGE_SECURITY | FILE_NOTIFY_CHANGE_LAST_WRITE;
++    if (filter) fsevents_do_change_notify( dir, filter, FILE_ACTION_MODIFIED, 0, relpath );
++}
++
++static void fsevents_poll_event( struct fd *fd, int event )
++{
++    unsigned int renamed_watch = 0, renamed_cookie = 0;
++    struct fsevent *fse, *next;
++
++    for (fse = fsevents_take(); fse; fse = next)
++    {
++        next = fse->next;
++        fsevents_handle( fse, &renamed_watch, &renamed_cookie );
++        free( fse );
++    }
++}
++
++static int init_inotify( void )
++{
++    int unix_fd;
++
++    if (fsevents_fd) return 1;
++    if ((unix_fd = fsevents_init()) == -1) return 0;
++    if (!(fsevents_fd = create_anonymous_fd( &fsevents_fd_ops, unix_fd, NULL, 0 ))) return 0;
++    set_fd_events( fsevents_fd, POLLIN );
++    return 1;
++}
++
++static int inotify_adjust_changes( struct dir *dir )
++{
++    char path[PATH_MAX];
++    size_t len;
++
++    if (!fsevents_fd) return 0;
++    if (dir->watch) return 1;  /* the stream watches everything; the filter is applied to its events */
++
++    if (fcntl( get_unix_fd( dir->fd ), F_GETPATH, path ) == -1) return 0;
++    len = strlen( path );
++    while (len > 1 && path[len - 1] == '/') path[--len] = 0;
++    if (!(dir->watch_path = strdup( path ))) return 0;
++
++    dir->watch_id = ++last_watch_id;
++    if (!(dir->watch = fsevents_watch( path, dir->watch_id )))
++    {
++        free( dir->watch_path );
++        dir->watch_path = NULL;
++        return 0;
++    }
++    return 1;
++}
++
++static void dir_remove_watch( struct dir *dir )
++{
++    struct known_item *item, *next;
++
++    if (dir->watch) fsevents_unwatch( dir->watch );
++    LIST_FOR_EACH_ENTRY_SAFE( item, next, &dir->known, struct known_item, entry ) forget_known( dir, item );
++    free( dir->watch_path );
++    dir->watch = NULL;
++    dir->watch_path = NULL;
++}
++
++static void free_inode( struct inode *inode )
++{
++    assert( 0 );
++}
++
++static void dir_add_to_existing_notify( struct dir *dir )
++{
++}
++
+ #else
+ 
+ static int init_inotify( void )
+@@ -1108,6 +1377,10 @@ static int inotify_adjust_changes( struct dir *dir )
+     return 0;
+ }
+ 
++static void dir_remove_watch( struct dir *dir )
++{
++}
++
+ static void free_inode( struct inode *inode )
+ {
+     assert( 0 );
+@@ -1133,6 +1406,12 @@ struct object *create_dir_obj( struct fd *fd, unsigned int access, mode_t mode )
+     dir->notified = 0;
+     dir->want_data = 0;
+     dir->inode = NULL;
++#if !defined(HAVE_SYS_INOTIFY_H) && defined(__APPLE__)
++    dir->watch = NULL;
++    dir->watch_path = NULL;
++    list_init( &dir->known );
++    dir->known_count = 0;
++#endif
+     grab_object( fd );
+     dir->fd = fd;
+     dir->mode = mode;
+diff --git a/server/fsevents.c b/server/fsevents.c
+new file mode 100644
+index 0000000..3658ba6
+--- /dev/null
++++ b/server/fsevents.c
+@@ -0,0 +1,175 @@
++/*
++ * Directory change notifications through FSEvents (macOS)
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#ifdef __APPLE__
++
++#include <errno.h>
++#include <fcntl.h>
++#include <pthread.h>
++#include <stdint.h>
++#include <stdlib.h>
++#include <string.h>
++#include <unistd.h>
++#include <CoreServices/CoreServices.h>
++
++#include "fsevents.h"
++
++/* FSEvents calls back on a dispatch queue, on a thread of its own, while the rest of wineserver is single-threaded.
++ * The callback therefore only copies the events into a list under a lock and writes a byte to a pipe that the
++ * server's poll loop watches; change.c then matches them to the directories on the server thread. */
++
++static dispatch_queue_t queue;
++static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
++static struct fsevent *head, **tail = &head;
++static int wake[2] = { -1, -1 };
++
++struct watch
++{
++    FSEventStreamRef stream;
++};
++
++static unsigned int translate_flags( FSEventStreamEventFlags flags )
++{
++    unsigned int ret = 0;
++
++    if (flags & (kFSEventStreamEventFlagMustScanSubDirs | kFSEventStreamEventFlagUserDropped |
++                 kFSEventStreamEventFlagKernelDropped))
++        ret |= FSE_RESCAN;
++    if (flags & kFSEventStreamEventFlagItemCreated) ret |= FSE_CREATED;
++    if (flags & kFSEventStreamEventFlagItemRemoved) ret |= FSE_REMOVED;
++    if (flags & kFSEventStreamEventFlagItemRenamed) ret |= FSE_RENAMED;
++    if (flags & kFSEventStreamEventFlagItemModified) ret |= FSE_MODIFIED;
++    if (flags & (kFSEventStreamEventFlagItemInodeMetaMod | kFSEventStreamEventFlagItemChangeOwner |
++                 kFSEventStreamEventFlagItemXattrMod | kFSEventStreamEventFlagItemFinderInfoMod))
++        ret |= FSE_ATTRIB;
++    if (flags & kFSEventStreamEventFlagItemIsDir) ret |= FSE_DIR;
++    return ret;
++}
++
++static void callback( ConstFSEventStreamRef stream, void *info, size_t count, void *paths,
++                      const FSEventStreamEventFlags flags[], const FSEventStreamEventId ids[] )
++{
++    unsigned int id = (uintptr_t)info;
++    struct fsevent *first = NULL, **last = &first;
++    char **names = paths;
++    size_t i, len;
++
++    for (i = 0; i < count; i++)
++    {
++        unsigned int fse = translate_flags( flags[i] );
++        struct fsevent *event;
++
++        if (!fse) continue;
++        len = strlen( names[i] );
++        if (!(event = malloc( offsetof( struct fsevent, path[len + 1] ) ))) continue;
++        event->next = NULL;
++        event->watch = id;
++        event->flags = fse;
++        memcpy( event->path, names[i], len + 1 );
++        *last = event;
++        last = &event->next;
++    }
++    if (!first) return;
++
++    /* one batch stays together, so a rename's old and new name arrive next to each other */
++    pthread_mutex_lock( &lock );
++    *tail = first;
++    tail = last;
++    pthread_mutex_unlock( &lock );
++    /* the pipe is non-blocking: when it is full, a wake-up is pending anyway */
++    write( wake[1], "", 1 );
++}
++
++int fsevents_init( void )
++{
++    if (wake[0] != -1) return wake[0];
++    if (pipe( wake ) == -1) return -1;
++    fcntl( wake[0], F_SETFL, O_NONBLOCK );
++    fcntl( wake[1], F_SETFL, O_NONBLOCK );
++    fcntl( wake[0], F_SETFD, FD_CLOEXEC );
++    fcntl( wake[1], F_SETFD, FD_CLOEXEC );
++    queue = dispatch_queue_create( "org.winehq.wineserver.fsevents", DISPATCH_QUEUE_SERIAL );
++    return wake[0];
++}
++
++void *fsevents_watch( const char *path, unsigned int id )
++{
++    FSEventStreamContext context = { 0, (void *)(uintptr_t)id, NULL, NULL, NULL };
++    CFStringRef string;
++    CFArrayRef array;
++    struct watch *watch;
++
++    if (!queue || !(watch = malloc( sizeof(*watch) ))) return NULL;
++    string = CFStringCreateWithFileSystemRepresentation( NULL, path );
++    array = string ? CFArrayCreate( NULL, (const void **)&string, 1, &kCFTypeArrayCallBacks ) : NULL;
++    /* file events: one event per item with its own path, not one per directory; no defer: the first change of a
++       quiet period is delivered at once, then at most every 10 ms */
++    watch->stream = array ? FSEventStreamCreate( NULL, callback, &context, array, kFSEventStreamEventIdSinceNow,
++                                                 0.01, kFSEventStreamCreateFlagFileEvents |
++                                                 kFSEventStreamCreateFlagNoDefer ) : NULL;
++    if (array) CFRelease( array );
++    if (string) CFRelease( string );
++    if (!watch->stream)
++    {
++        free( watch );
++        return NULL;
++    }
++    FSEventStreamSetDispatchQueue( watch->stream, queue );
++    if (!FSEventStreamStart( watch->stream ))
++    {
++        FSEventStreamInvalidate( watch->stream );
++        FSEventStreamRelease( watch->stream );
++        free( watch );
++        return NULL;
++    }
++    return watch;
++}
++
++static void stop_stream( void *arg )
++{
++    FSEventStreamRef stream = arg;
++
++    FSEventStreamStop( stream );
++    FSEventStreamInvalidate( stream );
++    FSEventStreamRelease( stream );
++}
++
++void fsevents_unwatch( void *arg )
++{
++    struct watch *watch = arg;
++
++    /* on the stream's own queue, so that no callback of it is still running afterwards */
++    dispatch_sync_f( queue, watch->stream, stop_stream );
++    free( watch );
++}
++
++struct fsevent *fsevents_take( void )
++{
++    struct fsevent *ret;
++    char buffer[64];
++
++    while (read( wake[0], buffer, sizeof(buffer) ) > 0);
++    pthread_mutex_lock( &lock );
++    ret = head;
++    head = NULL;
++    tail = &head;
++    pthread_mutex_unlock( &lock );
++    return ret;
++}
++
++#endif /* __APPLE__ */
+diff --git a/server/fsevents.h b/server/fsevents.h
+new file mode 100644
+index 0000000..54b3f94
+--- /dev/null
++++ b/server/fsevents.h
+@@ -0,0 +1,49 @@
++/*
++ * Directory change notifications through FSEvents (macOS)
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#ifndef __WINE_SERVER_FSEVENTS_H
++#define __WINE_SERVER_FSEVENTS_H
++
++/* Kept free of Wine's and Apple's headers: the two don't mix (BOOL, ULONG, ...), so change.c sees only this. */
++
++#define FSE_CREATED   0x01  /* an item appeared */
++#define FSE_REMOVED   0x02  /* an item went away */
++#define FSE_RENAMED   0x04  /* an item was renamed: the old or the new name, whichever this path is now */
++#define FSE_MODIFIED  0x08  /* a file's contents changed */
++#define FSE_ATTRIB    0x10  /* metadata changed: times, mode, owner, extended attributes */
++#define FSE_DIR       0x20  /* the item is a directory */
++#define FSE_RESCAN    0x40  /* events were dropped: everything below the watch may have changed */
++
++struct fsevent
++{
++    struct fsevent *next;
++    unsigned int    watch;  /* id given to fsevents_watch */
++    unsigned int    flags;  /* FSE_* */
++    char            path[1];
++};
++
++/* returns the read end of a pipe that becomes readable when events are queued, or -1 */
++extern int fsevents_init( void );
++/* starts watching the tree below path; events carry id */
++extern void *fsevents_watch( const char *path, unsigned int id );
++/* stops a watch; no event of it is queued afterwards */
++extern void fsevents_unwatch( void *watch );
++/* empties the wake-up pipe and returns the queued events, oldest first; free each with free() */
++extern struct fsevent *fsevents_take( void );
++
++#endif /* __WINE_SERVER_FSEVENTS_H */

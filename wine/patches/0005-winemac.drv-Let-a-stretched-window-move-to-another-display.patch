@@ -1,0 +1,38 @@
+winemac.drv: Let a stretched window move to another display.
+
+In Retina mode a Cocoa frame is in points, so a stretched window whose size
+is an odd number of pixels comes back from Cocoa one pixel wider or taller
+after the player merely moves it. winemac took that as a resize, and win32u
+handles a resize of a stretched window by fitting the stretching again and
+keeping the window on the work area of the monitor it was on: the window
+jumped back each time it was dragged towards another display.
+
+A frame within a pixel of the window's size is now a move.
+
+--- a/dlls/winemac.drv/window.c
++++ b/dlls/winemac.drv/window.c
+@@ -1769,16 +1769,23 @@
+         TRACE("%p moving from (%d,%d) to (%d,%d)\n", hwnd, data->rects.window.left,
+               data->rects.window.top, rect.left, rect.top);
+ 
++    stretch = data->stretch;
+     if ((data->rects.window.right - data->rects.window.left == width &&
+          data->rects.window.bottom - data->rects.window.top == height) ||
+         (IsRectEmpty(&data->rects.window) && width == 1 && height == 1))
+         flags |= SWP_NOSIZE;
++    /* In Retina mode a Cocoa frame is in points, so a stretched window of an odd pixel size comes back a pixel off
++       when the player only moves it. Taken as a resize, the move would be undone: win32u keeps a stretched window
++       on the work area of the monitor it was on, so it could not be dragged to another display. */
++    else if (stretch && retina_on &&
++             abs(data->rects.window.right - data->rects.window.left - width) <= 1 &&
++             abs(data->rects.window.bottom - data->rects.window.top - height) <= 1)
++        flags |= SWP_NOSIZE;
+     else
+         TRACE("%p resizing from (%dx%d) to (%dx%d)\n", hwnd, data->rects.window.right - data->rects.window.left,
+               data->rects.window.bottom - data->rects.window.top, width, height);
+ 
+     being_dragged = data->drag_event != NULL;
+-    stretch = data->stretch;
+     release_win_data(data);
+ 
+     if (event->window_frame_changed.fullscreen)
