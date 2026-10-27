@@ -1,5 +1,5 @@
 Wine 11.20 for EscApp, seventh build: the Epic Games Launcher installs games and keeps the player signed in, and a
-stretched game window can be moved to another display.
+game window can be moved to another display again.
 
 ## What's new
 
@@ -12,11 +12,15 @@ stretched game window can be moved to another display.
   to a key of its own that it keeps in Windows' key storage (a named CNG key), and Wine kept such keys only while
   the program ran. The launcher made a new key at each start and Epic's server refused the saved sign-in
   (`invalid_dpop_proof`). Wine now keeps named keys in the bottle's registry and opens them again by name.
-- **Stretched windows move between displays.** With Retina mode on, a game window that had been stretched jumped
-  back as soon as the player dragged it towards another display (from a MacBook's own screen to an external one,
-  for example). macOS gives such a window's frame in points, so a window an odd number of pixels wide or tall came
-  back a pixel off after a plain move; Wine took the move for a resize, and a resize keeps a stretched window on
-  the screen it is on. A frame within a pixel of the window's size is now a move.
+- **Big game windows leave a small screen.** A game window taller than the screen it was on (a 1928×1114 window
+  on a MacBook's own screen next to a bigger external display) could not be dragged off that screen: it jumped
+  back every time, and the game had to be restarted. macOS shrank the window to fit the screen, Wine set the
+  game's size again, macOS shrank it again, without end, and every drag was undone. macOS may now move such a
+  window but no longer resize it; the part that doesn't fit stays below the screen's edge.
+- **Stretched windows move between displays in Retina mode.** A stretched game window jumped back as soon as the
+  player dragged it towards another display: macOS gives its frame in points, so a window an odd number of pixels
+  wide or tall came back a pixel off after a plain move, and Wine took the move for the player stretching it. A
+  frame within a pixel of the window's size is now a move.
 
 ## What to watch for
 

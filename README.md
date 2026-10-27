@@ -27,8 +27,9 @@ These patches are applied (`wine/patches/`):
   the emulated display mode. It also fixes the Mac driver bugs this exposed (OpenGL drawn at a stale size or only
   a corner of it, a Direct3D 9 hang, white bars around an emulated full screen, DXMT views not following their
   window).
-- `0005` lets a stretched window move to another display in Retina mode: Cocoa returns its frame a pixel off, and
-  the move was taken as a resize that put the window back on its old display.
+- `0005` lets a stretched or fixed-size window move to another display: macOS shrank such a window to fit a smaller
+  screen, or returned its frame a pixel off in Retina mode, and Wine took that for the player stretching it and put
+  the window back on its old display.
 - `0006` reports directory changes (ReadDirectoryChangesW, FindFirstChangeNotification) through FSEvents: Wine
   only knows inotify, which macOS doesn't have, so a program waiting for a file to appear waited forever. The Epic
   Games Launcher waits that way for its helper when it installs a game. `tests/change/run.sh` checks it.

@@ -1,17 +1,93 @@
 winemac.drv: Let a stretched window move to another display.
 
-In Retina mode a Cocoa frame is in points, so a stretched window whose size
-is an odd number of pixels comes back from Cocoa one pixel wider or taller
-after the player merely moves it. winemac took that as a resize, and win32u
-handles a resize of a stretched window by fitting the stretching again and
-keeping the window on the work area of the monitor it was on: the window
-jumped back each time it was dragged towards another display.
+A stretched window is resizable on the Mac only so that the player can
+stretch it; the game keeps its size. Two things changed that size behind
+the player's back, and winemac took each for the player stretching the
+window. win32u handles that by fitting the stretching again and keeping the
+window on the work area of the monitor it was on, so the window could not
+be dragged to another display.
 
-A frame within a pixel of the window's size is now a move.
+- Cocoa shrinks a resizable window taller than the screen it lands on (a
+  1928x1114 window on a MacBook's 1728x1117 screen). Wine set the game's size
+  again, Cocoa shrank it again, endlessly, and every drag was undone. Cocoa
+  may now move a stretched window but not resize it, and a frame Cocoa
+  adjusted right after Wine set it is never taken for the player's.
+- In Retina mode a Cocoa frame is in points, so a window an odd number of
+  pixels wide or tall comes back a pixel off after a plain move. A frame
+  within a pixel of the window's size is now a move.
 
+--- a/dlls/winemac.drv/cocoa_window.h
++++ b/dlls/winemac.drv/cocoa_window.h
+@@ -32,6 +32,7 @@
+     BOOL preventsAppActivation;
+     BOOL floating;
+     BOOL resizable;
++    BOOL stretch;
+     BOOL maximized;
+     BOOL fullscreen;
+     BOOL pendingMinimize;
+--- a/dlls/winemac.drv/cocoa_window.m
++++ b/dlls/winemac.drv/cocoa_window.m
+@@ -913,6 +913,7 @@ static inline BOOL stage_manager_enabled(void)
+         window->savedContentMinSize = NSZeroSize;
+         window->savedContentMaxSize = NSMakeSize(FLT_MAX, FLT_MAX);
+         window->resizable = wf->resizable;
++        window->stretch = wf->stretch;
+ 
+         [window registerForDraggedTypes:@[@"public.data" /* UTTypeData */, @"public.content" /* UTTypeContent */]];
+ 
+@@ -1086,6 +1087,7 @@ static inline BOOL stage_manager_enabled(void)
+         }
+ 
+         resizable = wf->resizable;
++        stretch = wf->stretch;
+         [self adjustFeaturesForState];
+         [self setHasShadow:wf->shadow];
+     }
+@@ -2251,7 +2253,20 @@ static inline BOOL stage_manager_enabled(void)
+         NSRect contentRect = [self contentRectForFrameRect:frameRect];
+         if (!screen_covered_by_rect(contentRect, screens) &&
+             frame_intersects_screens(frameRect, screens))
+-            frameRect = [super constrainFrameRect:frameRect toScreen:screen];
++        {
++            NSRect constrained = [super constrainFrameRect:frameRect toScreen:screen];
++
++            // A stretched window is resizable only so that the player can stretch it, and the game keeps its
++            // size. Cocoa shrinks a resizable window that is taller than the screen it lands on; Wine took that
++            // for the player stretching it, set the game's size again and was shrunk again, endlessly, and the
++            // window could no longer be dragged off that screen. Let Cocoa move such a window, never resize it.
++            if (stretch)
++            {
++                constrained.origin.y += constrained.size.height - frameRect.size.height;
++                constrained.size = frameRect.size;
++            }
++            frameRect = constrained;
++        }
+         return frameRect;
+     }
+ 
+--- a/dlls/winemac.drv/macdrv_cocoa.h
++++ b/dlls/winemac.drv/macdrv_cocoa.h
+@@ -452,6 +452,7 @@ struct macdrv_window_features {
+     unsigned int    utility:1;
+     unsigned int    shadow:1;
+     unsigned int    prevents_app_activation:1;
++    unsigned int    stretch:1;
+ };
+ 
+ struct macdrv_window_state {
 --- a/dlls/winemac.drv/window.c
 +++ b/dlls/winemac.drv/window.c
-@@ -1769,16 +1769,23 @@
+@@ -90,7 +90,7 @@ static struct macdrv_window_features get_cocoa_window_
+ 
+     wf = get_window_features_for_style(style, ex_style, data->shaped);
+     /* a fixed-size game window the player may stretch; win32u keeps its size for the game */
+-    if (data->stretch && !data->shaped) wf.resizable = wf.shadow = TRUE;
++    if (data->stretch && !data->shaped) wf.resizable = wf.shadow = wf.stretch = TRUE;
+     return wf;
+ }
+ 
+@@ -1769,16 +1769,25 @@ void macdrv_window_frame_changed(HWND hwnd, const macd
          TRACE("%p moving from (%d,%d) to (%d,%d)\n", hwnd, data->rects.window.left,
                data->rects.window.top, rect.left, rect.top);
  
@@ -20,12 +96,14 @@ A frame within a pixel of the window's size is now a move.
           data->rects.window.bottom - data->rects.window.top == height) ||
          (IsRectEmpty(&data->rects.window) && width == 1 && height == 1))
          flags |= SWP_NOSIZE;
-+    /* In Retina mode a Cocoa frame is in points, so a stretched window of an odd pixel size comes back a pixel off
-+       when the player only moves it. Taken as a resize, the move would be undone: win32u keeps a stretched window
-+       on the work area of the monitor it was on, so it could not be dragged to another display. */
-+    else if (stretch && retina_on &&
-+             abs(data->rects.window.right - data->rects.window.left - width) <= 1 &&
-+             abs(data->rects.window.bottom - data->rects.window.top - height) <= 1)
++    /* Only the player stretches a stretched window. Taken as the player's resize, anything else would undo a move:
++       win32u keeps a stretched window on the work area of the monitor it was on, so it could not be dragged to
++       another display. In Retina mode a Cocoa frame is in points, so a window of an odd pixel size comes back a
++       pixel off after a plain move; and a frame Cocoa adjusted right after Wine set it is Cocoa's, not the
++       player's (it made the window fit a smaller screen, and Wine set the game's size again, endlessly). */
++    else if (stretch && (event->window_frame_changed.skip_size_move_loop ||
++             (retina_on && abs(data->rects.window.right - data->rects.window.left - width) <= 1 &&
++              abs(data->rects.window.bottom - data->rects.window.top - height) <= 1)))
 +        flags |= SWP_NOSIZE;
      else
          TRACE("%p resizing from (%dx%d) to (%dx%d)\n", hwnd, data->rects.window.right - data->rects.window.left,
