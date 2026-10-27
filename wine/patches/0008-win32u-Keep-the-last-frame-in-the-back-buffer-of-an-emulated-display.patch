@@ -1,0 +1,56 @@
+win32u: Keep the last frame in the back buffer of an emulated display.
+
+With EmulateModeset, a window's OpenGL drawable is a framebuffer surface whose
+swap exchanges the front and back attachments, so the new back buffer holds
+the frame before last. Chromium (so NW.js and Electron games) redraws only
+what changed and counts on the back buffer keeping what it drew last, as a copy
+swap does on Windows. Anything drawn only once then alternated with an older
+frame at every swap: after an NW.js game's window was maximized on a screen of
+another shape, the bars around its picture flickered between white and the
+picture from before, until the game happened to redraw the whole window.
+
+After exchanging the attachments, the new front buffer is now copied into the
+back one.
+
+--- a/dlls/win32u/opengl.c	2026-10-27 14:49:00
++++ b/dlls/win32u/opengl.c	2026-10-27 14:49:24
+@@ -1104,7 +1104,28 @@ static void framebuffer_surface_flush( struct opengl_d
+ 
+     make_client_context_current();
+ }
++
++/* The swap exchanges front and back, so the new back buffer holds the frame before last. Programs that redraw only
++ * what changed (Chromium, so NW.js and Electron games) count on what they drew last staying in the back buffer, as
++ * it does with a copy swap on Windows: a part drawn only once (the bars around a game's picture after the window was
++ * maximized) then flickered between that frame and an older one. Copy the new front buffer into the back one. */
++static void copy_front_to_back( GLuint fbo, SIZE size, BOOL stereo )
++{
++    const struct opengl_funcs *funcs = &display_funcs;
+ 
++    funcs->p_glBindFramebuffer( GL_READ_FRAMEBUFFER, fbo );
++    funcs->p_glBindFramebuffer( GL_DRAW_FRAMEBUFFER, fbo );
++    funcs->p_glReadBuffer( GL_COLOR_ATTACHMENT0 );
++    funcs->p_glDrawBuffer( GL_COLOR_ATTACHMENT1 );
++    funcs->p_glBlitFramebuffer( 0, 0, size.cx, size.cy, 0, 0, size.cx, size.cy, GL_COLOR_BUFFER_BIT, GL_NEAREST );
++    if (stereo)
++    {
++        funcs->p_glReadBuffer( GL_COLOR_ATTACHMENT2 );
++        funcs->p_glDrawBuffer( GL_COLOR_ATTACHMENT3 );
++        funcs->p_glBlitFramebuffer( 0, 0, size.cx, size.cy, 0, 0, size.cx, size.cy, GL_COLOR_BUFFER_BIT, GL_NEAREST );
++    }
++}
++
+ static BOOL framebuffer_surface_swap( struct opengl_drawable *drawable )
+ {
+     struct framebuffer_surface *surface = framebuffer_from_opengl_drawable( drawable );
+@@ -1148,6 +1169,10 @@ static BOOL framebuffer_surface_swap( struct opengl_dr
+             funcs->p_glFramebufferTexture( GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT2, back, 0 );
+             funcs->p_glFramebufferTexture( GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT3, front, 0 );
+         }
++
++        if (drawable->draw_fbo != drawable->read_fbo)
++            copy_front_to_back( drawable->draw_fbo, drawable->virtual_size, drawable->stereo );
++        copy_front_to_back( drawable->read_fbo, drawable->virtual_size, drawable->stereo );
+     }
+ 
+     if (surface->target)
