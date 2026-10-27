@@ -1,0 +1,237 @@
+server: Keep the permissions given to files and folders.
+
+A security descriptor set on a file or folder (SetNamedSecurityInfo,
+NtSetSecurityObject) was only turned into the Unix mode, and the next open
+built one again from that mode: whoever had been given access was gone. The
+Epic Games Launcher prepares a game's folder by granting the players' group
+full access from a second copy of itself, then reads the folder's permissions
+back and looks for that grant; it never found it and stopped the install with
+error DP-07 ("Authorize success without gaining access").
+
+The descriptor set last is now kept with the file in an extended attribute
+(user.wine.sd), together with the Unix mode it was set with, and is what the
+file reports from then on. The mode is still set as before. When the mode has
+since been changed outside Wine, the stored descriptor no longer describes
+the file and the one built from the mode is reported again. Access to the
+file when it is opened is decided as before, from the Unix mode.
+
+Generic rights in what is set (GENERIC_ALL) are mapped to the file's own, as
+Windows does, and programs read back the mapped rights.
+Entries that only pass to what is created inside keep them.
+
+--- a/server/change.c
++++ b/server/change.c
+@@ -339,13 +339,14 @@ static struct security_descriptor *dir_get_sd( struct object *obj )
+ 
+     /* mode and uid the same? if so, no need to re-generate security descriptor */
+     if (obj->sd &&
+-        (st.st_mode & (S_IRWXU|S_IRWXO)) == (dir->mode & (S_IRWXU|S_IRWXO)) &&
++        (st.st_mode & (S_IRWXU|S_IRWXG|S_IRWXO)) == (dir->mode & (S_IRWXU|S_IRWXG|S_IRWXO)) &&
+         (st.st_uid == dir->uid))
+         return obj->sd;
+ 
+-    sd = mode_to_sd( st.st_mode,
+-                     security_unix_uid_to_sid( st.st_uid ),
+-                     token_get_primary_group( current->process->token ));
++    if (!(sd = load_unix_fd_sd( unix_fd, st.st_mode )))
++        sd = mode_to_sd( st.st_mode,
++                         security_unix_uid_to_sid( st.st_uid ),
++                         token_get_primary_group( current->process->token ));
+     if (!sd) return obj->sd;
+ 
+     dir->mode = st.st_mode;
+@@ -361,7 +362,9 @@ static int dir_set_sd( struct object *obj, const struct security_descriptor *sd,
+     struct dir *dir = (struct dir *)obj;
+     const struct sid *owner;
+     struct stat st;
++    struct security_descriptor *mapped;
+     mode_t mode;
++    int ret;
+     int unix_fd;
+ 
+     assert( obj->ops == &dir_ops );
+@@ -370,6 +373,9 @@ static int dir_set_sd( struct object *obj, const struct security_descriptor *sd,
+ 
+     if (unix_fd == -1 || fstat( unix_fd, &st ) == -1) return 1;
+ 
++    /* the parts not being set stay as the file has them */
++    dir_get_sd( obj );
++
+     if (set_info & OWNER_SECURITY_INFORMATION)
+     {
+         owner = sd_get_owner( sd );
+@@ -400,6 +406,18 @@ static int dir_set_sd( struct object *obj, const struct security_descriptor *sd,
+             return 0;
+         }
+     }
++
++    /* keep what was set, so that the file reads it back however it is opened later */
++    mapped = map_sd_generic_access( obj, sd );
++    ret = default_set_sd( obj, mapped ? mapped : sd, set_info );
++    free( mapped );
++    if (!ret) return 0;
++    if (fstat( unix_fd, &st ) != -1)
++    {
++        dir->mode = st.st_mode;
++        dir->uid = st.st_uid;
++        store_unix_fd_sd( unix_fd, obj->sd, st.st_mode );
++    }
+     return 1;
+ }
+ 
+--- a/server/fd.c
++++ b/server/fd.c
+@@ -100,6 +100,7 @@
+ #include "handle.h"
+ #include "process.h"
+ #include "request.h"
++#include "security.h"
+ 
+ #include "winternl.h"
+ #include "winioctl.h"
+@@ -2391,6 +2392,73 @@ static int xattr_fremove( int filedes, const char *name )
+ #endif
+ }
+ 
++/* Windows keeps the permissions a program gives a file or folder (SetNamedSecurityInfo) with it. Wine turned them
++ * into the Unix mode and built them again from that mode, so whoever had been given access was gone the next time
++ * the file was opened: the Epic Games Launcher grants the players' group access to a game's folder from a second
++ * copy of itself, then looks for that grant and stopped the install with error DP-07. The security descriptor set
++ * last is kept in an extended attribute, with the Unix mode it was set with; once the mode has changed outside
++ * Wine it no longer describes the file and is ignored. */
++#define XATTR_SD XATTR_USER_PREFIX "wine.sd"
++#define STORED_SD_VERSION 1
++#define STORED_SD_MAX_SIZE 65536
++
++struct stored_sd
++{
++    unsigned int version;
++    unsigned int mode;  /* S_IRWXU|S_IRWXG|S_IRWXO of the file when it was stored */
++};
++
++void store_unix_fd_sd( int unix_fd, const struct security_descriptor *sd, mode_t mode )
++{
++    data_size_t size = sizeof(*sd) + sd->owner_len + sd->group_len + sd->sacl_len + sd->dacl_len;
++    struct stored_sd *stored;
++
++    if (sizeof(*stored) + size > STORED_SD_MAX_SIZE || !(stored = malloc( sizeof(*stored) + size ))) return;
++    stored->version = STORED_SD_VERSION;
++    stored->mode = mode & (S_IRWXU|S_IRWXG|S_IRWXO);
++    memcpy( stored + 1, sd, size );
++    xattr_fset( unix_fd, XATTR_SD, stored, sizeof(*stored) + size );
++    free( stored );
++}
++
++/* Windows maps generic rights (GENERIC_ALL) to the file's own when permissions are set, and programs look for
++ * those (FILE_ALL_ACCESS for GENERIC_ALL, which the Epic Games Launcher grants). Entries that only pass to what
++ * is created inside (INHERIT_ONLY_ACE) keep them, as on Windows. */
++struct security_descriptor *map_sd_generic_access( struct object *obj, const struct security_descriptor *sd )
++{
++    data_size_t size = sizeof(*sd) + sd->owner_len + sd->group_len + sd->sacl_len + sd->dacl_len;
++    struct security_descriptor *mapped;
++    const struct acl *dacl;
++    struct ace *ace;
++    unsigned int i;
++    int present;
++
++    if (!(mapped = malloc( size ))) return NULL;
++    memcpy( mapped, sd, size );
++    if (!(dacl = sd_get_dacl( mapped, &present )) || !present) return mapped;
++    for (i = 0, ace = (struct ace *)(dacl + 1); i < dacl->count; i++, ace = ace_next( ace ))
++        if (!(ace->flags & INHERIT_ONLY_ACE)) ace->mask = map_obj_access( obj, ace->mask );
++    return mapped;
++}
++
++struct security_descriptor *load_unix_fd_sd( int unix_fd, mode_t mode )
++{
++    struct security_descriptor *sd = NULL;
++    struct stored_sd *stored;
++    int size = xattr_fget( unix_fd, XATTR_SD, NULL, 0 );
++
++    if (size <= (int)sizeof(*stored) || size > STORED_SD_MAX_SIZE) return NULL;
++    if (!(stored = malloc( size ))) return NULL;
++    if (xattr_fget( unix_fd, XATTR_SD, stored, size ) == size &&
++        stored->version == STORED_SD_VERSION &&
++        stored->mode == (mode & (S_IRWXU|S_IRWXG|S_IRWXO)) &&
++        sd_is_valid( (struct security_descriptor *)(stored + 1), size - sizeof(*stored) ) &&
++        (sd = malloc( size - sizeof(*stored) )))
++        memcpy( sd, stored + 1, size - sizeof(*stored) );
++    free( stored );
++    return sd;
++}
++
+ static void set_reparse_point( struct fd *fd, struct async *async )
+ {
+     char *reparse_name;
+--- a/server/file.c
++++ b/server/file.c
+@@ -382,13 +382,14 @@ static struct security_descriptor *file_get_sd( struct object *obj )
+         return obj->sd;
+ 
+     /* mode and uid the same? if so, no need to re-generate security descriptor */
+-    if (obj->sd && (st.st_mode & (S_IRWXU|S_IRWXO)) == (file->mode & (S_IRWXU|S_IRWXO)) &&
++    if (obj->sd && (st.st_mode & (S_IRWXU|S_IRWXG|S_IRWXO)) == (file->mode & (S_IRWXU|S_IRWXG|S_IRWXO)) &&
+         (st.st_uid == file->uid))
+         return obj->sd;
+ 
+-    sd = mode_to_sd( st.st_mode,
+-                     security_unix_uid_to_sid( st.st_uid ),
+-                     token_get_primary_group( current->process->token ));
++    if (!(sd = load_unix_fd_sd( unix_fd, st.st_mode )))
++        sd = mode_to_sd( st.st_mode,
++                         security_unix_uid_to_sid( st.st_uid ),
++                         token_get_primary_group( current->process->token ));
+     if (!sd) return obj->sd;
+ 
+     file->mode = st.st_mode;
+@@ -483,7 +484,9 @@ static int file_set_sd( struct object *obj, const struct security_descriptor *sd
+     struct file *file = (struct file *)obj;
+     const struct sid *owner;
+     struct stat st;
++    struct security_descriptor *mapped;
+     mode_t mode;
++    int ret;
+     int unix_fd;
+ 
+     assert( obj->ops == &file_ops );
+@@ -492,6 +495,9 @@ static int file_set_sd( struct object *obj, const struct security_descriptor *sd
+ 
+     if (unix_fd == -1 || fstat( unix_fd, &st ) == -1) return 1;
+ 
++    /* the parts not being set stay as the file has them */
++    file_get_sd( obj );
++
+     if (set_info & OWNER_SECURITY_INFORMATION)
+     {
+         owner = sd_get_owner( sd );
+@@ -524,6 +530,18 @@ static int file_set_sd( struct object *obj, const struct security_descriptor *sd
+             return 0;
+         }
+     }
++
++    /* keep what was set, so that the file reads it back however it is opened later */
++    mapped = map_sd_generic_access( obj, sd );
++    ret = default_set_sd( obj, mapped ? mapped : sd, set_info );
++    free( mapped );
++    if (!ret) return 0;
++    if (fstat( unix_fd, &st ) != -1)
++    {
++        file->mode = st.st_mode;
++        file->uid = st.st_uid;
++        store_unix_fd_sd( unix_fd, obj->sd, st.st_mode );
++    }
+     return 1;
+ }
+ 
+--- a/server/file.h
++++ b/server/file.h
+@@ -162,6 +162,9 @@ extern struct file *create_file_for_fd_obj( struct fd *fd, unsigned int access,
+ extern void file_set_error(void);
+ extern struct security_descriptor *mode_to_sd( mode_t mode, const struct sid *user, const struct sid *group );
+ extern mode_t sd_to_mode( const struct security_descriptor *sd, const struct sid *owner );
++extern void store_unix_fd_sd( int unix_fd, const struct security_descriptor *sd, mode_t mode );
++extern struct security_descriptor *load_unix_fd_sd( int unix_fd, mode_t mode );
++extern struct security_descriptor *map_sd_generic_access( struct object *obj, const struct security_descriptor *sd );
+ extern int is_file_executable( const char *name );
+ 
+ /* file mapping functions */

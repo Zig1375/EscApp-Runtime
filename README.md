@@ -39,6 +39,10 @@ These patches are applied (`wine/patches/`):
 - `0008` keeps the last frame in an OpenGL window's back buffer when Wine emulates the display mode (EmulateModeset):
   the swap exchanged the buffers, and Chromium-based games, which redraw only what changed, flickered wherever
   they had drawn only once.
+- `0009` keeps the permissions a program gives a file or folder (SetNamedSecurityInfo) in an extended attribute
+  next to the Unix mode: Wine turned them into the mode and built them again from it, so a grant was gone at the
+  next open. The Epic Games Launcher grants the players' group access to a game's folder from its helper, looks
+  for that grant and stopped the install with DP-07 without it. `tests/acl/run.sh` checks it.
 
 Every download is pinned by SHA-256. Wine, Mono and Gecko come from WineHQ; the x86_64 libraries Wine loads
 (FreeType, GnuTLS, SDL2 and their dependencies) come unmodified from

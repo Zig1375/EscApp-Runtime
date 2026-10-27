@@ -14,7 +14,8 @@
 # changes through FSEvents (macOS has no inotify), which the Epic Games Launcher needs to install a game.
 # patches/0007 keeps named CNG keys across runs, which the Epic Games Launcher binds the player's sign-in to.
 # patches/0008 keeps the last frame in the back buffer of an emulated display, which Chromium-based games redraw
-# only in part.
+# only in part. patches/0009 keeps the permissions given to files and folders, which the Epic Games Launcher reads
+# back before it installs a game.
 # Why Wine 11.20, a development release: it passes the same probes as 11.0 (DXVK, DXMT and WineD3D, 32- and
 # 64-bit) and carries ten months of fixes the stable 11.0 branch doesn't get. Development releases change every
 # two weeks and winemac's internals move with them (patches/0001 had to be redone between 11.0 and 11.20), so
