@@ -12,6 +12,7 @@
 # window (StretchWindows): Wine scales it through the emulated display mode, and the game sees no resize;
 # patches/0005 lets such a window be dragged to another display in Retina mode. patches/0006 reports directory
 # changes through FSEvents (macOS has no inotify), which the Epic Games Launcher needs to install a game.
+# patches/0007 keeps named CNG keys across runs, which the Epic Games Launcher binds the player's sign-in to.
 # Why Wine 11.20, a development release: it passes the same probes as 11.0 (DXVK, DXMT and WineD3D, 32- and
 # 64-bit) and carries ten months of fixes the stable 11.0 branch doesn't get. Development releases change every
 # two weeks and winemac's internals move with them (patches/0001 had to be redone between 11.0 and 11.20), so

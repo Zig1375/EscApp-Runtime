@@ -32,6 +32,9 @@ These patches are applied (`wine/patches/`):
 - `0006` reports directory changes (ReadDirectoryChangesW, FindFirstChangeNotification) through FSEvents: Wine
   only knows inotify, which macOS doesn't have, so a program waiting for a file to appear waited forever. The Epic
   Games Launcher waits that way for its helper when it installs a game. `tests/change/run.sh` checks it.
+- `0007` keeps named CNG keys (NCryptCreatePersistedKey, NCryptOpenKey, NCryptDeleteKey) across runs, in the
+  prefix's registry: Wine kept them only in memory. The Epic Games Launcher binds the player's sign-in to such a
+  key, made a new one at every start and was signed out each time. `tests/ncrypt/run.sh` checks it.
 
 Every download is pinned by SHA-256. Wine, Mono and Gecko come from WineHQ; the x86_64 libraries Wine loads
 (FreeType, GnuTLS, SDL2 and their dependencies) come unmodified from
