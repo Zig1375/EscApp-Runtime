@@ -209,9 +209,11 @@ for bin in "$WORK"/stage/bin/wine "$WORK"/stage/bin/wineserver "$WORK"/stage/lib
 done
 grep -q '^#define SONAME_LIBVULKAN "libMoltenVK.dylib"' "$WORK/build/include/config.h" \
   || { echo "winevulkan isn't linked to MoltenVK; DXVK would find no Vulkan driver" >&2; exit 1; }
-nm -gU "$WORK/stage/lib/wine/x86_64-unix/winemac.so" | grep -q " _macdrv_functions$" \
+# Checks read all their input (grep >/dev/null, not -q): with pipefail, grep -q quitting early sent objdump a
+# SIGPIPE and failed the ntdll check of build 12 although the export was there.
+nm -gU "$WORK/stage/lib/wine/x86_64-unix/winemac.so" | grep " _macdrv_functions$" >/dev/null \
   || { echo "winemac.so doesn't export macdrv_functions; DXMT can't create its Metal view" >&2; exit 1; }
-x86_64-w64-mingw32-objdump -p "$WORK/stage/lib/wine/x86_64-windows/ntdll.dll" | grep -qE " __wine_unix_call$" \
+x86_64-w64-mingw32-objdump -p "$WORK/stage/lib/wine/x86_64-windows/ntdll.dll" | grep -E " __wine_unix_call$" >/dev/null \
   || { echo "ntdll.dll doesn't export __wine_unix_call; D3DMetal's d3d12.dll can't initialize" >&2; exit 1; }
 [ -f "$WORK/stage/lib/wine/x86_64-unix/winegstreamer.so" ] \
   || { echo "winegstreamer.so wasn't built; game videos wouldn't play (see configure.out)" >&2; exit 1; }
@@ -229,15 +231,15 @@ cp -a "$RLIB"/*.dylib "$W/lib/"
 # Wine versions: Vulkan is in winevulkan.so in 11.0 and in win32u.so in 11.20).
 loaders=0
 for so in "$W"/lib/wine/x86_64-unix/*.so; do
-  strings -a "$so" | grep -qE 'lib(gnutls\.30|freetype\.6|SDL2-2\.0\.0|MoltenVK)\.dylib' || continue
+  strings -a "$so" | grep -E 'lib(gnutls\.30|freetype\.6|SDL2-2\.0\.0|MoltenVK)\.dylib' >/dev/null || continue
   loaders=$((loaders + 1))
-  otool -l "$so" | grep -q "path @loader_path/../../ " || { echo "no rpath in $(basename "$so")" >&2; exit 1; }
+  otool -l "$so" | grep "path @loader_path/../../ " >/dev/null || { echo "no rpath in $(basename "$so")" >&2; exit 1; }
 done
 [ "$loaders" -ge 4 ] || { echo "only $loaders modules load the runtime libraries; did their names change?" >&2; exit 1; }
 for lib in libfreetype.6.dylib libgnutls.30.dylib libSDL2-2.0.0.dylib libMoltenVK.dylib; do
   [ -f "$W/lib/$lib" ] || { echo "runtime library missing: $lib" >&2; exit 1; }
 done
-otool -l "$W/lib/wine/x86_64-unix/winegstreamer.so" | grep -q "path @loader_path/../../ " \
+otool -l "$W/lib/wine/x86_64-unix/winegstreamer.so" | grep "path @loader_path/../../ " >/dev/null \
   || { echo "no rpath in winegstreamer.so" >&2; exit 1; }
 
 # GStreamer next to them: libraries in lib/, plugins in lib/gstreamer-1.0/, the plugin scanner in
@@ -262,7 +264,7 @@ done
 # configure prefix as text, only to compute relative paths; that is harmless.)
 for bin in "$W"/bin/wine "$W"/bin/wineserver "$W"/lib/wine/x86_64-unix/*; do
   [ -L "$bin" ] && continue
-  if { otool -L "$bin" | tail -n +2; otool -l "$bin" | grep -A2 LC_RPATH || true; } | grep -qF "$WORK"; then
+  if { otool -L "$bin" | tail -n +2; otool -l "$bin" | grep -A2 LC_RPATH || true; } | grep -F "$WORK" >/dev/null; then
     echo "build path leaked into $bin" >&2; exit 1
   fi
 done

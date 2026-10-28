@@ -1,0 +1,149 @@
+winemac.drv: Keep the Cocoa start-up handshake alive until both threads are done with it.
+
+The thread that starts the macOS driver asks the main thread to become the Cocoa application and waited five
+seconds for it, with the handshake's lock and data on its own stack. On a busy Mac (a game starting under Rosetta
+while Steam and other Wine processes start too) the main thread can be later than that: the driver gave up, the
+process lost its display, and when the main thread did get there it used the freed lock and crashed in
+objc_release or objc_msgSend.
+
+The handshake now lives on the heap with a reference for each thread, the main thread leaves Cocoa alone if the
+starting thread has given up, and the wait is a minute: Wine's main thread always ends up in its run loop, so a
+longer wait only costs time when something is badly wrong.
+
+--- a/dlls/winemac.drv/cocoa_main.m
++++ b/dlls/winemac.drv/cocoa_main.m
+@@ -44,9 +44,23 @@
+     unsigned long long  tickcount;
+     uint64_t            uptime_ns;
+     BOOL                success;
++    /* Set under the lock by macdrv_start_cocoa_app when it stopped waiting before the main thread
++       got here; the main thread then leaves Cocoa alone. */
++    BOOL                abandoned;
++    /* One reference for macdrv_start_cocoa_app and one for run_cocoa_app: the main thread may get
++       here after the starting thread gave up and returned, so the info can't live on its stack. */
++    int                 refs;
+ };
+ 
+ 
++static void release_startup_info(struct cocoa_app_startup_info* info)
++{
++    if (__atomic_sub_fetch(&info->refs, 1, __ATOMIC_ACQ_REL)) return;
++    [info->lock release];
++    free(info);
++}
++
++
+ /***********************************************************************
+  *              run_cocoa_app
+  *
+@@ -66,10 +80,18 @@
+ {
+     struct cocoa_app_startup_info* startup_info = info;
+     NSConditionLock* lock = startup_info->lock;
+-    BOOL created_app = FALSE;
++    BOOL created_app = FALSE, success = FALSE;
+ 
+     @autoreleasepool
+     {
++        [lock lock];
++        if (startup_info->abandoned)
++        {
++            [lock unlock];
++            release_startup_info(startup_info);
++            return;
++        }
++
+         if (!NSApp)
+         {
+             [WineApplication sharedApplication];
+@@ -84,15 +106,12 @@
+             startup_info->success = TRUE;
+         }
+ 
+-        /* Retain the lock while we're using it, so macdrv_start_cocoa_app()
+-           doesn't deallocate it in the middle of us unlocking it. */
+-        [lock retain];
+-        [lock lock];
++        success = startup_info->success;
+         [lock unlockWithCondition:COCOA_APP_RUNNING];
+-        [lock release];
+     }
++    release_startup_info(startup_info);
+ 
+-    if (created_app && startup_info->success)
++    if (created_app && success)
+     {
+         @autoreleasepool
+         {
+@@ -116,7 +135,7 @@
+ {
+     int ret = -1;
+     CFRunLoopSourceRef source;
+-    struct cocoa_app_startup_info startup_info;
++    struct cocoa_app_startup_info* startup_info;
+     uint64_t uptime_mach = mach_absolute_time();
+     mach_timebase_info_data_t mach_timebase;
+     NSDate* timeLimit;
+@@ -128,35 +147,51 @@
+                              toTarget:[NSThread class]
+                            withObject:nil];
+ 
+-    startup_info.lock = [[NSConditionLock alloc] initWithCondition:COCOA_APP_NOT_RUNNING];
+-    startup_info.tickcount = tickcount;
+-    startup_info.success = FALSE;
++    if (!(startup_info = calloc(1, sizeof(*startup_info)))) return -1;
++    startup_info->lock = [[NSConditionLock alloc] initWithCondition:COCOA_APP_NOT_RUNNING];
++    startup_info->tickcount = tickcount;
++    startup_info->refs = 1;
+ 
+     mach_timebase_info(&mach_timebase);
+-    startup_info.uptime_ns = uptime_mach * mach_timebase.numer / mach_timebase.denom;
++    startup_info->uptime_ns = uptime_mach * mach_timebase.numer / mach_timebase.denom;
+ 
+-    timeLimit = [NSDate dateWithTimeIntervalSinceNow:5];
++    /* The main thread used to get five seconds, and a busy Mac (a game starting under Rosetta while
++       Steam and other Wine processes start too) missed that: the process lost its display, and the
++       main thread later crashed on the info this function had already freed. Wine's main thread
++       always ends up in its run loop, so waiting longer only costs time when something is badly
++       wrong. */
++    timeLimit = [NSDate dateWithTimeIntervalSinceNow:60];
+ 
+-    source_context.info = &startup_info;
++    source_context.info = startup_info;
+     source_context.perform = run_cocoa_app;
+     source = CFRunLoopSourceCreate(NULL, 0, &source_context);
+ 
+-    if (source && startup_info.lock && timeLimit)
++    if (source && startup_info->lock && timeLimit)
+     {
++        NSConditionLock* lock = startup_info->lock;
++
++        __atomic_add_fetch(&startup_info->refs, 1, __ATOMIC_ACQ_REL);
+         CFRunLoopAddSource(CFRunLoopGetMain(), source, kCFRunLoopCommonModes);
+         CFRunLoopSourceSignal(source);
+         CFRunLoopWakeUp(CFRunLoopGetMain());
+ 
+-        if ([startup_info.lock lockWhenCondition:COCOA_APP_RUNNING beforeDate:timeLimit])
++        if (![lock lockWhenCondition:COCOA_APP_RUNNING beforeDate:timeLimit])
+         {
+-            [startup_info.lock unlock];
+-            ret = !startup_info.success;
++            /* The main thread may have finished just now; otherwise tell it to stay out. */
++            [lock lock];
++            if ([lock condition] != COCOA_APP_RUNNING) startup_info->abandoned = TRUE;
+         }
++        if (!startup_info->abandoned) ret = !startup_info->success;
++        [lock unlock];
++
++        /* A source removed before it ran never gives back the main thread's reference: that
++           leaks the small info on this failure path instead of risking a use after free. */
++        if (startup_info->abandoned) CFRunLoopSourceInvalidate(source);
+     }
+ 
+     if (source)
+         CFRelease(source);
+-    [startup_info.lock release];
++    release_startup_info(startup_info);
+     return ret;
+ }
+ }
