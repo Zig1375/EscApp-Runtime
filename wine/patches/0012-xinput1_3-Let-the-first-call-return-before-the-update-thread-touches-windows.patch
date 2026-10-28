@@ -1,0 +1,39 @@
+xinput1_3: Let the first call return before the update thread touches windows.
+
+The first XInput call starts the controller update thread and waits until it has
+listed the controllers. The thread used to register its window class, create its
+message window and register for device notifications first. On macOS that class
+registration waited for the window lock, whose holder waited for the calling
+thread: when the first call came from a game's main thread, the game hung for
+good. Among Us (Unity, Rewired) froze on a black window right after its intro on
+every graphics backend.
+
+The thread now lists the controllers and lets the caller go before any window
+work. A controller plugged in before the notification is registered is still
+found by the thread's periodic rescan.
+
+--- a/dlls/xinput1_3/main.c
++++ b/dlls/xinput1_3/main.c
+@@ -719,14 +719,19 @@
+ 
+     SetThreadDescription(GetCurrentThread(), L"wine_xinput_hid_update");
+ 
++    /* The caller that started this thread waits for the controller list, and may be a game's main thread that
++     * other threads need for window work. Let it go before taking any of the window lock ourselves: on macOS the
++     * class registration below waited for that lock while its holder waited for the game's main thread, and the
++     * game hung on its first XInput call. A controller plugged in before the notification is registered is found
++     * by the periodic rescan. */
++    update_controller_list();
++    SetEvent(start_event);
++
+     RegisterClassExW(&cls);
+     hwnd = CreateWindowExW(0, cls.lpszClassName, NULL, 0, 0, 0, 0, 0,
+                            HWND_MESSAGE, NULL, NULL, NULL);
+     notif = RegisterDeviceNotificationW(hwnd, &filter, DEVICE_NOTIFY_WINDOW_HANDLE);
+ 
+-    update_controller_list();
+-    SetEvent(start_event);
+-
+     do
+     {
+         if (ret == count) while (PeekMessageW(&msg, hwnd, 0, 0, PM_REMOVE)) DispatchMessageW(&msg);
