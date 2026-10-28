@@ -1,0 +1,257 @@
+ntdll: Let D3DMetal run its macOS code from Windows threads.
+
+Apple's D3DMetal is split into Windows DLLs (d3d12, dxgi, d3d11, d3d10) and a macOS
+library (libd3dshared.dylib), and the two call each other directly: dxgi.dll gives
+the macOS side callbacks for events, semaphores, threads, windows and the registry,
+and starts threads whose Windows entry point calls straight into the macOS library.
+That code then runs with the %gs base Windows code has. Since Wine on macOS makes
+the TEB the %gs base while Windows code runs, macOS functions there read their
+thread data from the TEB: pthread_setname_np found a NULL pthread_self() and every
+Direct3D 12 game crashed at start.
+
+With WINEMACSHAREDTSD=1, Windows code runs with the macOS thread data as its %gs
+base too. Windows code reads two TEB fields through %gs directly, the TEB itself
+(%gs:0x30) and the TLS array (%gs:0x58); both get a copy in the macOS thread data,
+in slots macOS leaves alone (6 is pointer munging, unused under Rosetta; 11 is
+ttyname's buffer). The loader keeps the TLS copy current for every thread. Slot 12
+(%gs:0x60, the PEB) is localtime's buffer, which overwrote the PEB when it was used,
+so Wine's own code reads the PEB through the TEB instead, as it now does for the
+other thread data its dispatchers read through %gs. The %gs base for Windows code is
+kept per thread (pe_tsd_base), the TEB unless the setting is on, so nothing changes
+without it. EscApp sets it only for games running on D3DMetal, since Windows code
+then can't read other TEB fields through %gs.
+
+Written for EscApp against Wine 11.20. Like the code it changes, this patch is
+licensed under the GNU LGPL 2.1 or later.
+
+diff --git a/dlls/ntdll/loader.c b/dlls/ntdll/loader.c
+--- a/dlls/ntdll/loader.c
++++ b/dlls/ntdll/loader.c
+@@ -1334,6 +1334,23 @@
+ }
+ 
+ /*************************************************************************
++ *		set_tls_pointer
++ *
++ * Sets a thread's TLS array, and on macOS also its copy in the %gs base Windows code runs with, when that is the
++ * macOS thread data rather than the TEB (WINEMACSHAREDTSD): Windows code reads the array at %gs:0x58.
++ */
++static void set_tls_pointer( TEB *teb, void **pointers )
++{
++    teb->ThreadLocalStoragePointer = pointers;
++#ifdef __x86_64__
++    {
++        void **pe_tsd_base = *(void ***)((char *)teb + 0x348);  /* amd64_thread_data()->pe_tsd_base */
++        if (pe_tsd_base && pe_tsd_base != (void **)teb) pe_tsd_base[11] = pointers;
++    }
++#endif
++}
++
++/*************************************************************************
+  *		alloc_tls_slot
+  *
+  * Allocate a TLS slot for a newly-loaded module.
+@@ -1403,7 +1420,7 @@
+ 
+             if (!new) return FALSE;
+             if (old) memcpy( new, old, old_module_count * sizeof(*new) );
+-            teb->ThreadLocalStoragePointer = new;
++            set_tls_pointer( teb, new );
+             TRACE( "thread %04lx tls block %p -> %p\n", HandleToULong(teb->ClientId.UniqueThread), old, new );
+             /* FIXME: can't free old block here, should be freed at thread exit */
+         }
+@@ -1648,7 +1665,7 @@
+ 
+         TRACE( "slot %u: %u/%lu bytes at %p\n", i, size, dir->SizeOfZeroFill, pointers[i] );
+     }
+-    NtCurrentTeb()->ThreadLocalStoragePointer = pointers;
++    set_tls_pointer( NtCurrentTeb(), pointers );
+     return STATUS_SUCCESS;
+ }
+ 
+@@ -4007,7 +4024,7 @@
+     RtlAcquirePebLock();
+     if ((pointers = NtCurrentTeb()->ThreadLocalStoragePointer))
+     {
+-        NtCurrentTeb()->ThreadLocalStoragePointer = NULL;
++        set_tls_pointer( NtCurrentTeb(), NULL );
+         for (i = 0; i < tls_module_count; i++) RtlFreeHeap( GetProcessHeap(), 0, pointers[i] );
+         RtlFreeHeap( GetProcessHeap(), 0, pointers );
+     }
+diff --git a/dlls/ntdll/signal_x86_64.c b/dlls/ntdll/signal_x86_64.c
+--- a/dlls/ntdll/signal_x86_64.c
++++ b/dlls/ntdll/signal_x86_64.c
+@@ -496,7 +496,8 @@
+                    "movl 0x28(%rsp),%edx\n\t"  /* len */
+                    "movl 0x2c(%rsp),%r8d\n\t"  /* id */
+ #ifdef __WINE_PE_BUILD
+-                   "movq %gs:0x60,%rax\n\t"     /* peb */
++                   "movq %gs:0x30,%rax\n\t"     /* teb */
++                   "movq 0x60(%rax),%rax\n\t"   /* teb->Peb */
+                    "movq 0x58(%rax),%rax\n\t"   /* peb->KernelCallbackTable */
+                    "call *(%rax,%r8,8)\n\t"     /* KernelCallbackTable[id] */
+                    ".seh_handler " __ASM_NAME("user_callback_handler") ", @except\n\t"
+@@ -906,7 +907,8 @@
+                    "movq %rax,0xf8(%rdx)\n\t"   /* context->Rip */
+                    "movq %rax,0x10(%rcx)\n\t"   /* rec->ExceptionAddress */
+                    "movl $1,%r8d\n\t"
+-                   "movq %gs:0x60,%rax\n\t"     /* Peb */
++                   "movq %gs:0x30,%rax\n\t"     /* teb */
++                   "movq 0x60(%rax),%rax\n\t"   /* teb->Peb */
+                    "cmpb $0,0x02(%rax)\n\t"     /* BeingDebugged */
+                    "jne 1f\n\t"
+                    "call " __ASM_NAME("dispatch_exception") "\n"
+@@ -1150,7 +1152,8 @@
+                    ".seh_stackalloc 0x28\n\t"
+                    ".seh_endprologue\n\t"
+                    ".seh_handler DbgUiRemoteBreakin_handler, @except\n\t"
+-                   "mov %gs:0x60,%rax\n\t"
++                   "movq %gs:0x30,%rax\n\t"     /* teb */
++                   "movq 0x60(%rax),%rax\n\t"   /* teb->Peb */
+                    "cmpb $0,2(%rax)\n\t"
+                    "je 1f\n\t"
+                    "call " __ASM_NAME("DbgBreakPoint") "\n"
+diff --git a/dlls/ntdll/unix/signal_x86_64.c b/dlls/ntdll/unix/signal_x86_64.c
+--- a/dlls/ntdll/unix/signal_x86_64.c
++++ b/dlls/ntdll/unix/signal_x86_64.c
+@@ -94,6 +94,17 @@
+ static USHORT ds64_sel;  /* selector for %ds/%es/%ss in 64-bit mode */
+ static USHORT fs32_sel;  /* selector for %fs in 32-bit mode */
+ 
++#ifdef __APPLE__
++/* Apple's D3DMetal calls between its Windows DLLs and its macOS library directly, without going through
++ * Wine's dispatchers, so its macOS code runs with whatever %gs base Windows code has. With the TEB as base
++ * (Wine's default), macOS functions read their thread data from the TEB: pthread_setname_np found a NULL
++ * pthread_self() and every Direct3D 12 game crashed at start. WINEMACSHAREDTSD=1 keeps the macOS thread data as
++ * the base while Windows code runs as well, with the two TEB fields Windows code reads through %gs copied into
++ * slots macOS leaves free. EscApp sets it only for D3DMetal, since Windows code then can't read other TEB
++ * fields through %gs. */
++static BOOL shared_tsd_base;
++#endif
++
+ /***********************************************************************
+  * signal context platform-specific definitions
+  */
+@@ -516,6 +527,7 @@
+     DWORD                 fs;            /* 0338 WOW TEB selector */
+     DWORD                 mxcsr;         /* 033c Unix-side mxcsr register */
+     char                  syscall_dispatch; /* 0340 */
++    void                 *pe_tsd_base;   /* 0348 macOS: %gs base while Windows code runs (shared_tsd_base) */
+ };
+ 
+ C_ASSERT( sizeof(struct amd64_thread_data) <= sizeof(((struct teb_data *)0)->cpu_data) );
+@@ -525,6 +537,7 @@
+ C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct amd64_thread_data, fs ) == 0x338 );
+ C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct amd64_thread_data, mxcsr ) == 0x33c );
+ C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct amd64_thread_data, syscall_dispatch ) == 0x340 );
++C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct amd64_thread_data, pe_tsd_base ) == 0x348 );
+ 
+ static inline struct amd64_thread_data *amd64_thread_data( struct thread_data *data )
+ {
+@@ -825,7 +838,7 @@
+ #elif defined __APPLE__
+     if (!is_inside_signal_stack( data, (void *)RSP_sig(sigcontext )) &&
+         !is_inside_syscall( data, RSP_sig(sigcontext )))
+-        _thread_set_tsd_base( (uint64_t)data->teb );
++        _thread_set_tsd_base( (uint64_t)amd64_data->pe_tsd_base );
+ #endif
+     if (is_16bit( sigcontext )) return;
+ #ifdef DS_sig
+@@ -1684,7 +1697,7 @@
+                    "1:\n\t"
+ #elif defined __APPLE__
+                    "movq %rcx,%r10\n\t"
+-                   "movq %r13,%rdi\n\t"
++                   "movq 0x348(%r13),%rdi\n\t" /* amd64_thread_data()->pe_tsd_base */
+                    "xorl %esi,%esi\n\t"
+                    "movl $0x3000003,%eax\n\t"  /* _thread_set_tsd_base */
+                    "syscall\n\t"
+@@ -2822,6 +2835,12 @@
+ 
+     __asm__( "movw %%cs,%0" : "=m" (cs64_sel) );
+     __asm__( "movw %%ss,%0" : "=m" (ds64_sel) );
++#ifdef __APPLE__
++    {
++        const char *shared = getenv( "WINEMACSHAREDTSD" );
++        shared_tsd_base = shared && atoi( shared );
++    }
++#endif
+ 
+     if (wow_teb)
+     {
+@@ -2920,6 +2939,17 @@
+     sysarch( X86_64_SET_GSBASE, &teb );
+ #elif defined (__APPLE__)
+     thread_data->pthread_teb = mac_thread_gsbase();
++    thread_data->pe_tsd_base = teb;
++    if (shared_tsd_base)
++    {
++        /* Windows code finds its TEB at %gs:0x30 and its TLS array at %gs:0x58. Both slots are free in the
++         * macOS thread data (6: pointer munging, unused under Rosetta; 11: ttyname's buffer); the loader keeps
++         * slot 11 current (set_tls_pointer). */
++        void **tsd = thread_data->pthread_teb;
++        tsd[6] = teb;
++        tsd[11] = teb->ThreadLocalStoragePointer;
++        thread_data->pe_tsd_base = tsd;
++    }
+ #else
+ # error Please define setting %gs for your architecture
+ #endif
+@@ -3028,7 +3058,8 @@
+  */
+ __ASM_GLOBAL_FUNC( __wine_syscall_dispatcher,
+                    __ASM_LOCAL_LABEL("__wine_syscall_dispatcher_gs_load") ":\n\t"
+-                   "movq %gs:0x378,%rcx\n\t"       /* thread_data->syscall_frame */
++                   "movq %gs:0x30,%rcx\n\t"        /* teb */
++                   "movq 0x378(%rcx),%rcx\n\t"    /* thread_data->syscall_frame */
+                    "popq 0x70(%rcx)\n\t"           /* frame->rip */
+                    __ASM_CFI(".cfi_adjust_cfa_offset -8\n\t")
+                    __ASM_CFI_REG_IS_AT2(rip, rcx, 0xf0,0x00)
+@@ -3213,7 +3244,7 @@
+ #elif defined __APPLE__
+                    "movq %rax,%r8\n\t"
+                    "movq %rcx,%rdx\n\t"
+-                   "movq %r13,%rdi\n\t"            /* teb */
++                   "movq 0x348(%r13),%rdi\n\t"     /* amd64_thread_data()->pe_tsd_base */
+                    "xorl %esi,%esi\n\t"
+                    "movl $0x3000003,%eax\n\t"      /* _thread_set_tsd_base */
+                    "syscall\n\t"
+@@ -3307,7 +3338,8 @@
+                    "popfq\n\t"
+                    "iretq\n"
+                    /* RESTORE_FLAGS_INSTRUMENTATION */
+-                   "2:\tmovq %gs:0x330,%r10\n\t"  /* amd64_thread_data()->instrumentation_callback */
++                   "2:\tmovq %gs:0x30,%r10\n\t"  /* teb */
++                   "movq 0x330(%r10),%r10\n\t" /* amd64_thread_data()->instrumentation_callback */
+                    "movq (%r10),%r10\n\t"
+                    "test %r10,%r10\n\t"
+                    "jz 3b\n\t"
+@@ -3366,7 +3398,8 @@
+                    "jmp " __ASM_LOCAL_LABEL("__wine_syscall_dispatcher_return") )
+ 
+ __ASM_GLOBAL_FUNC( __wine_syscall_dispatcher_instrumentation,
+-                   "movq %gs:0x378,%rcx\n\t"       /* thread_data->syscall_frame */
++                   "movq %gs:0x30,%rcx\n\t"        /* teb */
++                   "movq 0x378(%rcx),%rcx\n\t"    /* thread_data->syscall_frame */
+                    "popq 0x70(%rcx)\n\t"           /* frame->rip */
+                    __ASM_CFI(".cfi_adjust_cfa_offset -8\n\t")
+                    __ASM_CFI_REG_IS_AT2(rip, rcx, 0xf0,0x00)
+@@ -3384,7 +3417,8 @@
+ __ASM_GLOBAL_FUNC( __wine_unix_call_dispatcher,
+                    "movq %rcx,%r10\n\t"
+                    __ASM_LOCAL_LABEL("__wine_unix_call_dispatcher_gs_load") ":\n\t"
+-                   "movq %gs:0x378,%rcx\n\t"       /* thread_data->syscall_frame */
++                   "movq %gs:0x30,%rcx\n\t"        /* teb */
++                   "movq 0x378(%rcx),%rcx\n\t"    /* thread_data->syscall_frame */
+                    "popq 0x70(%rcx)\n\t"           /* frame->rip */
+                    __ASM_CFI(".cfi_adjust_cfa_offset -8\n\t")
+                    __ASM_CFI_REG_IS_AT2(rip, rcx, 0xf0,0x00)
+@@ -3509,7 +3543,7 @@
+ #elif defined __APPLE__
+                    "movq %rax,%rdx\n\t"
+                    "movq %rcx,%r14\n\t"
+-                   "movq %r13,%rdi\n\t"            /* teb */
++                   "movq 0x348(%r13),%rdi\n\t"     /* amd64_thread_data()->pe_tsd_base */
+                    "xorl %esi,%esi\n\t"
+                    "movl $0x3000003,%eax\n\t"      /* _thread_set_tsd_base */
+                    "syscall\n\t"

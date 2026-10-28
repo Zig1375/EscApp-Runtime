@@ -1,0 +1,44 @@
+ntdll: Export __wine_unix_call for D3DMetal.
+
+Apple's D3DMetal ships Wine DLLs (d3d12, dxgi, d3d11, d3d10) that make their
+unix calls through a function ntdll exports as __wine_unix_call. Wine only
+exports __wine_unix_call_dispatcher, a pointer, so the loader leaves the import
+unresolved, d3d12.dll fails to initialize and no Direct3D 12 game starts
+("d3d12.dll failed to initialize, aborting"). Export a function by that name
+that forwards to the dispatcher.
+
+Written for EscApp against Wine 11.20. Like the code it changes, this patch is
+licensed under the GNU LGPL 2.1 or later.
+
+diff --git a/dlls/ntdll/loader.c b/dlls/ntdll/loader.c
+--- a/dlls/ntdll/loader.c
++++ b/dlls/ntdll/loader.c
+@@ -74,6 +74,17 @@
+ 
+ static DWORD (WINAPI *pCtrlRoutine)(void *);
+ 
++/***********************************************************************
++ *           __wine_unix_call   (NTDLL.@)
++ *
++ * Unix calls through an exported function rather than __wine_unix_call_dispatcher. Apple's D3DMetal DLLs import
++ * it by this name, and without it d3d12.dll fails to initialize, so no Direct3D 12 game starts.
++ */
++NTSTATUS WINAPI ntdll_exported_unix_call( unixlib_handle_t handle, unsigned int code, void *args )
++{
++    return __wine_unix_call_dispatcher( handle, code, args );
++}
++
+ SYSTEM_DLL_INIT_BLOCK LdrSystemDllInitBlock = { 0xf0 };
+ 
+ void *__wine_syscall_dispatcher = NULL;
+diff --git a/dlls/ntdll/ntdll.spec b/dlls/ntdll/ntdll.spec
+--- a/dlls/ntdll/ntdll.spec
++++ b/dlls/ntdll/ntdll.spec
+@@ -1777,6 +1777,7 @@
+ @ extern -private __wine_unix_call_dispatcher
+ @ extern -private -arch=arm64ec __wine_unix_call_dispatcher_arm64ec
+ @ extern -private __wine_unixlib_handle
++@ stdcall -norelay __wine_unix_call(int64 long ptr) ntdll_exported_unix_call
+ 
+ # Debugging
+ @ stdcall -norelay __wine_dbg_write(ptr long)

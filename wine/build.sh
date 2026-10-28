@@ -15,7 +15,9 @@
 # patches/0007 keeps named CNG keys across runs, which the Epic Games Launcher binds the player's sign-in to.
 # patches/0008 keeps the last frame in the back buffer of an emulated display, which Chromium-based games redraw
 # only in part. patches/0009 keeps the permissions given to files and folders, which the Epic Games Launcher reads
-# back before it installs a game.
+# back before it installs a game. patches/0010 and 0011 let Apple's D3DMetal run Direct3D 12 games (the player's
+# own copy, added in EscApp): ntdll exports the __wine_unix_call its DLLs import, and with WINEMACSHAREDTSD=1 its
+# macOS library can be called straight from Windows threads.
 # Why Wine 11.20, a development release: it passes the same probes as 11.0 (DXVK, DXMT and WineD3D, 32- and
 # 64-bit) and carries ten months of fixes the stable 11.0 branch doesn't get. Development releases change every
 # two weeks and winemac's internals move with them (patches/0001 had to be redone between 11.0 and 11.20), so
@@ -209,6 +211,8 @@ grep -q '^#define SONAME_LIBVULKAN "libMoltenVK.dylib"' "$WORK/build/include/con
   || { echo "winevulkan isn't linked to MoltenVK; DXVK would find no Vulkan driver" >&2; exit 1; }
 nm -gU "$WORK/stage/lib/wine/x86_64-unix/winemac.so" | grep -q " _macdrv_functions$" \
   || { echo "winemac.so doesn't export macdrv_functions; DXMT can't create its Metal view" >&2; exit 1; }
+x86_64-w64-mingw32-objdump -p "$WORK/stage/lib/wine/x86_64-windows/ntdll.dll" | grep -qE " __wine_unix_call$" \
+  || { echo "ntdll.dll doesn't export __wine_unix_call; D3DMetal's d3d12.dll can't initialize" >&2; exit 1; }
 [ -f "$WORK/stage/lib/wine/x86_64-unix/winegstreamer.so" ] \
   || { echo "winegstreamer.so wasn't built; game videos wouldn't play (see configure.out)" >&2; exit 1; }
 
