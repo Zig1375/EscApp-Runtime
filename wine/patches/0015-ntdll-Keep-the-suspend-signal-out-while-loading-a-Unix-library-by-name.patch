@@ -1,0 +1,67 @@
+ntdll: Keep the suspend signal out while loading a Unix library by name.
+
+dlopen, dlsym and dlclose hold the macOS loader's lock. MemoryWineLoadUnixLibByName ran them with signals open,
+so a thread could be suspended while holding that lock. Steam's web helper hung for good at start: Chromium's
+stack sampler suspended the main thread inside dlopen, the GPU thread held virtual_mutex while waiting for the
+loader's lock, and the sampler waited for virtual_mutex before it would resume the main thread.
+
+Block the server signals around the loader calls of MemoryWineLoadUnixLibByName and MemoryWineUnloadUnixLib, as
+load_builtin_unixlib already does with its uninterrupted section; the library's init function still runs with
+signals open.
+
+--- a/dlls/ntdll/unix/virtual.c
++++ b/dlls/ntdll/unix/virtual.c
+@@ -5787,16 +5787,33 @@
+                 NTSTATUS (*entry)(void) = NULL;
+                 const void *funcs;
+                 void *handle;
++                sigset_t sigset;
+ 
+-                if ((status = load_unixlib_by_name( name, &handle ))) return status;
++                /* dlopen, dlsym and dlclose hold the macOS loader's lock. A thread suspended while holding it
++                 * (Chromium's stack sampler suspends its main thread at any time) stops every other thread that
++                 * loads anything, among them one holding virtual_mutex that the suspender itself then waits for:
++                 * Steam's web helper hung for good at start. Like load_builtin_unixlib, keep the suspend signal
++                 * out until the loader is done. */
++                pthread_sigmask( SIG_BLOCK, &server_block_set, &sigset );
++                if ((status = load_unixlib_by_name( name, &handle )))
++                {
++                    pthread_sigmask( SIG_SETMASK, &sigset, NULL );
++                    return status;
++                }
+                 res[0] = (UINT_PTR)handle;
+-                if (!(status = get_unixlib_funcs( handle, info_class == MemoryWineLoadUnixLibByNameWow64,
+-                                                  &funcs, &entry )))
++                status = get_unixlib_funcs( handle, info_class == MemoryWineLoadUnixLibByNameWow64, &funcs, &entry );
++                pthread_sigmask( SIG_SETMASK, &sigset, NULL );
++                if (!status)
+                 {
+                     res[1] = (UINT_PTR)funcs;
+                     if (entry) status = entry();
+                 }
+-                if (status) dlclose( handle );
++                if (status)
++                {
++                    pthread_sigmask( SIG_BLOCK, &server_block_set, &sigset );
++                    dlclose( handle );
++                    pthread_sigmask( SIG_SETMASK, &sigset, NULL );
++                }
+                 else memcpy( buffer, res, min( len, sizeof(res) ));
+                 return status;
+             }
+@@ -5806,8 +5823,14 @@
+             if (process == GetCurrentProcess())
+             {
+                 const unixlib_module_t *handle = addr;
++                sigset_t sigset;
++                int ret;
+ 
+-                if (!dlclose( (void *)(UINT_PTR)*handle )) return STATUS_SUCCESS;
++                /* See MemoryWineLoadUnixLibByName: no suspension while holding the loader's lock. */
++                pthread_sigmask( SIG_BLOCK, &server_block_set, &sigset );
++                ret = dlclose( (void *)(UINT_PTR)*handle );
++                pthread_sigmask( SIG_SETMASK, &sigset, NULL );
++                if (!ret) return STATUS_SUCCESS;
+             }
+             return STATUS_INVALID_HANDLE;
+ 
