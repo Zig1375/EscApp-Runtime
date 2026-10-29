@@ -67,6 +67,11 @@ These patches are applied (`wine/patches/`):
   paused holding the macOS loader's lock. Steam's window could stop for good at start: Chromium's stack sampler
   suspended the main thread inside `dlopen`, a thread holding `virtual_mutex` waited for the loader's lock, and
   the sampler waited for that thread. The library's own init still runs with signals open.
+- `0016` detaches an OpenGL context from its view on the thread that is destroying the context, instead of on the
+  main thread. AppKit deallocates a context by asking it to detach, and Wine answered with a block on the main
+  thread that held the context being deallocated — a context that was already being torn down. The block was left
+  with freed memory and crashed in `objc_release` on release, killing the process: Steam did this on nearly every
+  start while it set up its windows, and Banished and Among Us died the same way.
 
 Every download is pinned by SHA-256. Wine, Mono and Gecko come from WineHQ; the x86_64 libraries Wine loads
 (FreeType, GnuTLS, SDL2 and their dependencies) come unmodified from

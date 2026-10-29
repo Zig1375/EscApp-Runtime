@@ -1,0 +1,46 @@
+winemac.drv: Don't hand a dying GL context to the main thread.
+
+AppKit's -[NSOpenGLContext dealloc] sends -clearDrawable, on whatever thread released the context. Wine's
+-clearDrawable answers by running that detach on the main thread, and the block it queues captures self, so the
+context being deallocated was retained: its reference count went back up while the runtime was tearing it down.
+The block was then left holding freed memory, and releasing it crashed in objc_release, on the Cocoa main thread,
+taking the process with it. Steam's window and GL context churn hit this on nearly every start; logs of Banished
+and Among Us have the same crash in objc_release. A context that is being deallocated now does the detach on the
+thread that is deallocating it, which is what AppKit is asking for.
+
+--- a/dlls/winemac.drv/cocoa_opengl.m
++++ b/dlls/winemac.drv/cocoa_opengl.m
+@@ -30,6 +30,11 @@
+ 
+ 
+ @interface WineOpenGLContext ()
++{
++    /* Set by -dealloc: AppKit's own -dealloc calls -clearDrawable, and the work must not be handed to the main
++       thread then. */
++    BOOL releasing;
++}
+ @property (retain, nonatomic) NSView* latentView;
+ @property (nullable, weak) NSView *view;    /* redeclare this to avoid NSOpenGLContext's deprecation warnings */
+ 
+@@ -45,6 +50,7 @@
+ 
+     - (void) dealloc
+     {
++        releasing = TRUE;
+         [[self view] release];
+         [latentView release];
+         [super dealloc];
+@@ -149,7 +155,12 @@
+     - (void) clearDrawable
+     {
+         NSView* oldView = [self view];
+-        if ([NSThread isMainThread])
++        /* Wine runs the detach on the main thread, which means capturing self in a block. AppKit calls
++           -clearDrawable from its own -dealloc, on the thread that released the context, and capturing self then
++           retains an object that is already being deallocated: the block is left holding freed memory and
++           releasing it crashes in objc_release (Steam's window and context churn did this on nearly every start).
++           While the object is being deallocated, do it on this thread, which is what AppKit is asking for. */
++        if (releasing || [NSThread isMainThread])
+             [super clearDrawable];
+         else OnMainThread(^{
+             [super clearDrawable];
