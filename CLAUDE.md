@@ -35,6 +35,23 @@ refuses a revision without one. Keep it current as you work:
 - Never let Wine show a dialog: set `HKCU\Software\Wine\WineDbg ShowCrashDialog=dword:0` in a test prefix before
   running anything, and read crashes from the logs.
 
+## Chasing a crash on a macOS thread
+
+A fault on a thread Wine didn't create (the Cocoa main thread) is usually `objc_release` on an object that was
+already freed; patch 0014 prints the native stack into the process log, and that is where to start.
+
+- Freed memory usually still looks like a live object, so an over-release kills the process only now and then. Run
+  the same program with `MallocScribble=1` and it becomes reproducible nearly every start (the Steam client died
+  five times out of five that way, and not once in eight runs after patch 0016).
+- To try a change without touching the user's installed runtime: rebuild one DLL (`make
+  dlls/winemac.drv/winemac.so -j$(sysctl -n hw.ncpu)` in `wine/.cache/work/build`), clone the installed tree with
+  `cp -c -R`, drop the new `.so` into `<clone>/lib/wine/x86_64-unix/`, and run from the clone.
+- Name the culprit by logging `__builtin_return_address(0)` at the suspect call and symbolizing it with `dladdr`,
+  the way `log_native_frame` does in patch 0014. An address in an Apple framework (AppKit sending `clearDrawable`
+  from `-[NSOpenGLContext dealloc]`) says the object was freed while macOS still held it.
+- Never read a pointer that may be dead without checking: `mincore` answers for a mapped page even when it is not
+  readable (`PROT_NONE`), so a guard based on it still faults. Print raw pointers, or check with `mach_vm_region`.
+
 ## Our own code only
 
 Never copy code from other applications or their build scripts, whatever their license and even with attribution. Take the idea, then design and write the implementation
