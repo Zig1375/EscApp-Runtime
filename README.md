@@ -43,6 +43,30 @@ These patches are applied (`wine/patches/`):
   next to the Unix mode: Wine turned them into the mode and built them again from it, so a grant was gone at the
   next open. The Epic Games Launcher grants the players' group access to a game's folder from its helper, looks
   for that grant and stopped the install with DP-07 without it. `tests/acl/run.sh` checks it.
+- `0010` exports `__wine_unix_call` from ntdll, the function Apple's D3DMetal DLLs (`d3d12`, `dxgi`, `d3d11`,
+  `d3d10`) import for their unix calls. Wine exports only the dispatcher pointer, so the import stayed unresolved,
+  `d3d12.dll` failed to initialize and no Direct3D 12 game started ("d3d12.dll failed to initialize, aborting").
+- `0011` lets D3DMetal's macOS library run from the threads its Windows DLLs start: with `WINEMACSHAREDTSD=1`
+  Windows code keeps the macOS thread data as its `%gs` base while it calls into that library, which reads the
+  thread data there; without it `pthread_setname_np` saw a NULL `pthread_self()` and every Direct3D 12 game
+  crashed at start. Nothing changes without the setting, which EscApp turns on only for D3DMetal.
+- `0012` makes the first XInput call return before the controller update thread touches any window. The thread
+  registered its window class and message window first, and on macOS the class registration waited for the window
+  lock whose holder waited for the calling thread: Among Us (Unity, Rewired) hung for good on a black window right
+  after its intro, on every graphics backend. A controller plugged in meanwhile is still found by the rescan.
+- `0013` keeps winemac's Cocoa start-up handshake alive until both threads are done with it. The thread that
+  started the macOS driver waited five seconds for the main thread to become the Cocoa application, with the
+  handshake on its own stack: on a busy Mac (a game under Rosetta while Steam and other Wine processes start) the
+  main thread came later, the process lost its display, and the main thread then crashed on the freed handshake in
+  `objc_release`. It now lives on the heap, and the wait is a minute.
+- `0014` logs the native stack, with libraries and function names, when a thread Wine didn't create faults: a
+  fault there (macOS's main thread, or one of Apple's) ended the process with only an address in the log. Among Us
+  died in `objc_release` on such a thread, and Steam's helpers and Banished died the same way, with nothing saying
+  whose object was released.
+- `0015` keeps the suspend signal out while a Unix library is loaded or unloaded by name, so no thread can be
+  paused holding the macOS loader's lock. Steam's window could stop for good at start: Chromium's stack sampler
+  suspended the main thread inside `dlopen`, a thread holding `virtual_mutex` waited for the loader's lock, and
+  the sampler waited for that thread. The library's own init still runs with signals open.
 
 Every download is pinned by SHA-256. Wine, Mono and Gecko come from WineHQ; the x86_64 libraries Wine loads
 (FreeType, GnuTLS, SDL2 and their dependencies) come unmodified from
