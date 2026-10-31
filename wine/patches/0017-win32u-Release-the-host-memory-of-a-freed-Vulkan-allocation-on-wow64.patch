@@ -1,0 +1,57 @@
+win32u: Release the host memory of a freed Vulkan allocation on wow64.
+
+A 32-bit program needs every mapped Vulkan pointer to fit in 32 bits, so win32u backs each host-visible
+allocation with pages of its own (NtAllocateVirtualMemory under the 4 GB line) and imports them through
+VK_EXT_external_memory_host. Those pages are meant to be kept in the allocation's vm_map and released by
+vkFreeMemory, but the helper that allocates them keeps the pointer to itself, and vkAllocateMemory stored its
+own mapping variable, still NULL. No freed allocation ever gave its pages back. A 32-bit Direct3D 11 game on DXVK
+that creates and drops textures as it goes ran out of address space after a few minutes: Daughter for Dessert
+(GameMaker) crashed with "allocate_virtual_memory out of memory" and DxvkError after ten to fifteen scenes, with
+DXVK holding well under 1 GB. The imported pages are now stored in vm_map, so vkFreeMemory releases them, and
+they are released too when the allocation fails or the host pointer is refused.
+
+--- a/dlls/win32u/vulkan.c
++++ b/dlls/win32u/vulkan.c
+@@ -217,6 +217,8 @@
+                                                               mapping, &props )))
+     {
+         ERR( "vkGetMemoryHostPointerPropertiesEXT failed: %d\n", res );
++        alloc_size = 0;
++        NtFreeVirtualMemory( GetCurrentProcess(), &mapping, &alloc_size, MEM_RELEASE );
+         return res;
+     }
+ 
+@@ -942,8 +944,20 @@
+     if (physical_device->external_memory_align && (mem_flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) && !pointer_info &&
+         (res = allocate_external_host_memory( device, alloc_info, mem_flags, &host_pointer_info )))
+         return res;
++    /* The pages imported as host memory are this allocation's mapping: keep them in vm_map, so that
++       vkFreeMemory releases them. Left NULL, every freed allocation kept its pages, and a 32-bit game that
++       allocates and frees as it goes ran out of address space. */
++    if (alloc_info->pNext == (void *)&host_pointer_info) mapping = host_pointer_info.pHostPointer;
+ 
+-    if (!(memory = calloc( 1, sizeof(*memory) ))) return VK_ERROR_OUT_OF_HOST_MEMORY;
++    if (!(memory = calloc( 1, sizeof(*memory) )))
++    {
++        if (mapping)
++        {
++            SIZE_T alloc_size = 0;
++            NtFreeVirtualMemory( GetCurrentProcess(), &mapping, &alloc_size, MEM_RELEASE );
++        }
++        return VK_ERROR_OUT_OF_HOST_MEMORY;
++    }
+ 
+     if (import_win32)
+     {
+@@ -1046,6 +1060,11 @@
+     d3dkmt_destroy_mutex( memory->mutex );
+     d3dkmt_destroy_sync( memory->sync );
+     free( memory );
++    if (mapping)
++    {
++        SIZE_T alloc_size = 0;
++        NtFreeVirtualMemory( GetCurrentProcess(), &mapping, &alloc_size, MEM_RELEASE );
++    }
+     return VK_ERROR_OUT_OF_HOST_MEMORY;
+ }
+ 

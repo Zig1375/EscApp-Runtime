@@ -73,6 +73,10 @@ These patches are applied (`wine/patches/`):
   thread that held the context being deallocated — a context that was already being torn down. The block was left
   with freed memory and crashed in `objc_release` on release, killing the process: Steam did this on nearly every
   start while it set up its windows, and Banished and Among Us died the same way.
+- `0017` gives back the memory of a freed Vulkan allocation in a 32-bit program. Wine backs each mapped allocation
+  with its own pages below 4 GB so the pointer fits in 32 bits, but stored a NULL in place of those pages, so
+  freeing the allocation never released them. A 32-bit Direct3D 11 game on DXVK ran out of address space after a
+  few minutes: Daughter for Dessert (GameMaker) crashed after ten to fifteen scenes with DXVK holding under 1 GB.
 
 Every download is pinned by SHA-256. Wine, Mono and Gecko come from WineHQ; the x86_64 libraries Wine loads
 (FreeType, GnuTLS, SDL2 and their dependencies) come unmodified from
