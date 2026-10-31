@@ -62,7 +62,8 @@ These patches are applied (`wine/patches/`):
 - `0014` logs the native stack, with libraries and function names, when a thread Wine didn't create faults: a
   fault there (macOS's main thread, or one of Apple's) ended the process with only an address in the log. Among Us
   died in `objc_release` on such a thread, and Steam's helpers and Banished died the same way, with nothing saying
-  whose object was released.
+  whose object was released. The bare addresses are logged before they are named, since naming them takes the
+  macOS loader's lock, which a thread that crashed inside the loader still holds.
 - `0015` keeps the suspend signal out while a Unix library is loaded or unloaded by name, so no thread can be
   paused holding the macOS loader's lock. Steam's window could stop for good at start: Chromium's stack sampler
   suspended the main thread inside `dlopen`, a thread holding `virtual_mutex` waited for the loader's lock, and

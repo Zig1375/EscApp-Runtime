@@ -4,7 +4,8 @@ A fault on a thread without a TEB (on macOS: the Cocoa main thread, or one of Ap
 "Exception c0000005 in system thread at <address>" in the log. Among Us died four seconds after start in
 objc_release on such a thread, and Steam's helpers and Banished died the same way, with nothing saying whose
 object was released. Before ending the process, log the native return addresses with their libraries and
-symbols, reading the stack through mach_vm_read_overwrite so a broken frame can't fault again.
+symbols, reading the stack through mach_vm_read_overwrite so a broken frame can't fault again. The raw addresses
+are logged before they are named: dladdr takes dyld's lock, and a thread that faulted holding it would hang there.
 
 --- a/dlls/ntdll/unix/thread.c
 +++ b/dlls/ntdll/unix/thread.c
@@ -18,11 +19,9 @@ symbols, reading the stack through mach_vm_read_overwrite so a broken frame can'
  #endif
  #ifdef __FreeBSD__
  #include <sys/thr.h>
-@@ -1589,8 +1591,56 @@
-     return STATUS_SUCCESS;
- }
+@@ -1593,6 +1595,67 @@ NTSTATUS apple_spawn_main_thread( void )
  #endif
-+
+ 
  
 +#if defined(__APPLE__) && defined(__x86_64__)
 +/* Reads memory of this process without faulting: the thread is already handling a fault. */
@@ -32,7 +31,7 @@ symbols, reading the stack through mach_vm_read_overwrite so a broken frame can'
 +    return !mach_vm_read_overwrite( mach_task_self(), addr, sizeof(*value), (mach_vm_address_t)value, &size ) &&
 +           size == sizeof(*value);
 +}
- 
++
 +static void log_native_frame( const char *what, ULONG_PTR pc )
 +{
 +    Dl_info info;
@@ -50,22 +49,35 @@ symbols, reading the stack through mach_vm_read_overwrite so a broken frame can'
 +/* A thread Wine didn't create (on macOS: the Cocoa main thread, or one of Apple's own) has no Windows
 + * debugger or handler, and its fault ends the process with only an address in the log. Among Us died four
 + * seconds after start in objc_release on such a thread, and the address alone named no culprit. Log the
-+ * native stack, so the log says whose object it was. */
++ * native stack, so the log says whose object it was.
++ *
++ * The addresses are collected and logged first, and only then named: dladdr takes dyld's lock, and a thread
++ * that faulted while holding it (inside dlopen, say) would hang there instead of ending the process. The raw
++ * addresses are in the log by then either way. */
 +static void log_system_thread_stack( const CONTEXT *context )
 +{
-+    ULONG_PTR frame = context->Rbp, next, ret, top;
-+    int i;
++    ULONG_PTR frame = context->Rbp, next, ret, top, pcs[50];
++    const char *whats[50];
++    int i, count = 0;
 +
-+    log_native_frame( "at", context->Rip );
++    pcs[count] = context->Rip;
++    whats[count++] = "at";
 +    /* A leaf function may not have set up a frame yet: its caller's address is on top of the stack. */
-+    if (read_native_word( context->Rsp, &top )) log_native_frame( "sp", top );
++    if (read_native_word( context->Rsp, &top ))
++    {
++        pcs[count] = top;
++        whats[count++] = "sp";
++    }
 +    for (i = 0; i < 48 && frame && !(frame & 7); i++)
 +    {
 +        if (!read_native_word( frame + 8, &ret ) || !ret) break;
-+        log_native_frame( "from", ret );
++        pcs[count] = ret;
++        whats[count++] = "from";
 +        if (!read_native_word( frame, &next ) || next <= frame) break;
 +        frame = next;
 +    }
++    for (i = 0; i < count; i++) ERR_(seh)( "  %s %p\n", whats[i], (void *)pcs[i] );
++    for (i = 0; i < count; i++) log_native_frame( whats[i], pcs[i] );
 +}
 +#else
 +static void log_system_thread_stack( const CONTEXT *context ) { }
@@ -75,7 +87,7 @@ symbols, reading the stack through mach_vm_read_overwrite so a broken frame can'
  /**********************************************************************
   *           send_debug_event
   *
-@@ -1609,6 +1659,7 @@
+@@ -1611,6 +1674,7 @@ NTSTATUS send_debug_event( struct thread_data *data, EXCEPTION_RECORD *rec,
      if (!data->teb)
      {
          ERR_(seh)( "Exception %x in system thread at %p\n", rec->ExceptionCode, rec->ExceptionAddress );
